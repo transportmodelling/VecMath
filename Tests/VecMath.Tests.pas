@@ -1,0 +1,317 @@
+unit VecMath.Tests;
+
+////////////////////////////////////////////////////////////////////////////////
+//
+// Author: Jaap Baak (initial implementation developed with Claude Fable 5)
+// https://github.com/transportmodelling/VecMath
+//
+////////////////////////////////////////////////////////////////////////////////
+
+////////////////////////////////////////////////////////////////////////////////
+// Unit tests for VecMath.
+//
+// Strategy: every SIMD path has a trustworthy reference -
+//   * element-wise ops: all engine implementations must agree bit-exactly
+//     with the pure-Pascal base class (same arithmetic per element);
+//   * Exp/Log: compared against System.Exp / System.Ln with tight tolerances
+//     (sums compare with tolerance, since fused multiply-add and
+//     multi-accumulator summation legitimately change rounding).
+//
+// Lengths are chosen to hit every code path: scalar tails (1-3), the 4-quad
+// interleaved groups (15/16/17), the L1 block boundary (511/512/513), and
+// multi-block arrays.
+////////////////////////////////////////////////////////////////////////////////
+
+interface
+
+uses
+  DUnitX.TestFramework,
+  VecMath,
+  VecMath.CPU,
+  VecMath.SSE2,
+  VecMath.AVX;
+
+type
+  [TestFixture]
+  TVectorMathTests = class
+  private
+    FEngines: TArray<TVectorMath>;
+    FNames:   TArray<string>;
+    Procedure AddEngine(Engine: TVectorMath; const Name: string);
+  public
+    [Setup]    Procedure Setup;
+    [TearDown] Procedure TearDown;
+
+    [Test] Procedure ElementWiseOps_AllEnginesBitIdentical;
+    [Test] Procedure Sum_MatchesNaiveReference;
+    [Test] Procedure WeightedSumBlock_MatchesNaiveReference;
+    [Test] Procedure Exp_MatchesSystemExp;
+    [Test] Procedure Log_MatchesSystemLn;
+    [Test] Procedure ExpWithSum_SumMatchesArray;
+    [Test] Procedure Exp_ScratchOverloadIdentical;
+  end;
+
+implementation
+
+uses
+  System.SysUtils,
+  System.Math;
+
+const
+  // Lengths covering scalar tails, 4-quad groups, and L1 block boundaries.
+  LENS: array[0..13] of Integer =
+    (1, 2, 3, 4, 5, 7, 15, 16, 17, 511, 512, 513, 1000, 2048);
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+function RandomArray(Len: Integer; Lo, Hi: Double): TArray<Double>;
+var I: Integer;
+begin
+  SetLength(Result, Len);
+  for I := 0 to Len - 1 do
+    Result[I] := Lo + (Hi - Lo) * Random;
+end;
+
+// Relative error with an absolute floor: near-zero references are compared
+// absolutely (relevant for Log results near ln(1) = 0).
+function RelErr(Actual, Ref: Double): Double;
+begin
+  Result := Abs(Actual - Ref) / Max(1.0, Abs(Ref));
+end;
+
+// ---------------------------------------------------------------------------
+// TVectorMathTests
+// ---------------------------------------------------------------------------
+
+Procedure TVectorMathTests.AddEngine(Engine: TVectorMath; const Name: string);
+begin
+  FEngines := FEngines + [Engine];
+  FNames   := FNames + [Name];
+end;
+
+Procedure TVectorMathTests.Setup;
+var F: TCpuFeatures;
+begin
+  RandSeed := 20260611;   // fixed seed: failures must be reproducible
+  AddEngine(TVectorMath.Create, 'Scalar');
+  F := GetCpuFeatures;
+  if F.HasSSE2 then AddEngine(TVectorMathSSE2.Create, 'SSE2');
+  if F.HasAVX  then AddEngine(TVectorMathAVX.Create,  'AVX');
+  if F.HasAVX2 then AddEngine(TVectorMathAVX2.Create, 'AVX2');
+end;
+
+Procedure TVectorMathTests.TearDown;
+var I: Integer;
+begin
+  for I := 0 to High(FEngines) do FEngines[I].Free;
+  FEngines := nil;
+  FNames   := nil;
+end;
+
+Procedure TVectorMathTests.ElementWiseOps_AllEnginesBitIdentical;
+// Add/Subtract/Multiply/Divide/Sqrt perform the same IEEE 754 operation per
+// element in every implementation, so results must be bit-identical to the
+// scalar base class - any difference indicates an indexing or tail bug.
+var
+  E, L, I, Op: Integer;
+  A, B, RefR, R: TArray<Double>;
+  Len: Integer;
+const
+  OPS = 9;
+  OP_NAMES: array[0..OPS-1] of string = (
+    'Add(s,V)', 'Add(V,V)', 'Subtract(s,V)', 'Subtract(V,V)',
+    'Multiply(s,V)', 'Multiply(V,V)', 'Divide(s,V)', 'Divide(V,V)', 'Sqrt');
+
+  Procedure Run(Eng: TVectorMath; const Res: TArray<Double>);
+  begin
+    case Op of
+      0: Eng.Add(2.5, A, Res);
+      1: Eng.Add(A, B, Res);
+      2: Eng.Subtract(0.25, A, Res);
+      3: Eng.Subtract(A, B, Res);
+      4: Eng.Multiply(3.5, A, Res);
+      5: Eng.Multiply(A, B, Res);
+      6: Eng.Divide(3.0, A, Res);
+      7: Eng.Divide(A, B, Res);
+      8: Eng.Sqrt(A, Res);
+    end;
+  end;
+
+begin
+  for L := 0 to High(LENS) do
+  begin
+    Len := LENS[L];
+    A := RandomArray(Len, 0.1, 100.0);   // positive: valid for Sqrt/Divide
+    B := RandomArray(Len, 0.1, 100.0);
+    SetLength(RefR, Len);
+    SetLength(R, Len);
+    for Op := 0 to OPS - 1 do
+    begin
+      Run(FEngines[0], RefR);            // scalar base = reference
+      for E := 1 to High(FEngines) do
+      begin
+        Run(FEngines[E], R);
+        for I := 0 to Len - 1 do
+          Assert.IsTrue(R[I] = RefR[I], Format(
+            '%s/%s Len=%d i=%d: %.17g <> %.17g',
+            [FNames[E], OP_NAMES[Op], Len, I, R[I], RefR[I]]));
+      end;
+    end;
+  end;
+end;
+
+Procedure TVectorMathTests.Sum_MatchesNaiveReference;
+// Summation order differs between implementations (multi-accumulator SIMD),
+// so compare with a tolerance instead of exactly.
+var
+  E, L, I: Integer;
+  A: TArray<Double>;
+  Ref, S: Double;
+begin
+  for L := 0 to High(LENS) do
+  begin
+    A := RandomArray(LENS[L], -1.0, 1.0);
+    Ref := 0.0;
+    for I := 0 to High(A) do Ref := Ref + A[I];
+    for E := 0 to High(FEngines) do
+    begin
+      S := FEngines[E].Sum(A);
+      Assert.IsTrue(Abs(S - Ref) <= 1e-12 * Max(1.0, Abs(Ref)), Format(
+        '%s Sum Len=%d: %.17g <> ref %.17g',
+        [FNames[E], LENS[L], S, Ref]));
+    end;
+  end;
+end;
+
+Procedure TVectorMathTests.WeightedSumBlock_MatchesNaiveReference;
+// Dot product Sum Data[i]*Weights[i].  Accumulation order differs between
+// implementations, so compare with a tolerance.  Weights include exact zeros:
+// 0*finite must contribute exactly 0.
+var
+  E, L, I: Integer;
+  A, W: TArray<Double>;
+  Ref, S: Double;
+begin
+  for L := 0 to High(LENS) do
+  begin
+    A := RandomArray(LENS[L], -1.0, 1.0);
+    W := RandomArray(LENS[L], 0.0, 2.0);
+    for I := 0 to High(W) do
+      if I mod 3 = 0 then W[I] := 0.0;
+    Ref := 0.0;
+    for I := 0 to High(A) do Ref := Ref + A[I] * W[I];
+    for E := 0 to High(FEngines) do
+    begin
+      S := FEngines[E].WeightedSumBlock(Pointer(A), Pointer(W), LENS[L]);
+      Assert.IsTrue(Abs(S - Ref) <= 1e-12 * Max(1.0, Abs(Ref)), Format(
+        '%s WeightedSumBlock Len=%d: %.17g <> ref %.17g',
+        [FNames[E], LENS[L], S, Ref]));
+    end;
+  end;
+end;
+
+Procedure TVectorMathTests.Exp_MatchesSystemExp;
+var
+  E, L, I: Integer;
+  A, R: TArray<Double>;
+  Ref, MaxErr, Err: Double;
+begin
+  for L := 0 to High(LENS) do
+  begin
+    A := RandomArray(LENS[L], -700.0, 700.0);   // full finite double range
+    SetLength(R, LENS[L]);
+    for E := 0 to High(FEngines) do
+    begin
+      FEngines[E].Exp(A, R);
+      MaxErr := 0.0;
+      for I := 0 to High(A) do
+      begin
+        Ref := System.Exp(A[I]);
+        Err := Abs(R[I] - Ref) / Ref;           // exp > 0: pure relative
+        if Err > MaxErr then MaxErr := Err;
+      end;
+      Assert.IsTrue(MaxErr < 2e-14, Format(
+        '%s Exp Len=%d: max rel err %.3g exceeds 2e-14',
+        [FNames[E], LENS[L], MaxErr]));
+    end;
+  end;
+end;
+
+Procedure TVectorMathTests.Log_MatchesSystemLn;
+var
+  E, L, I: Integer;
+  A, R: TArray<Double>;
+  MaxErr, Err: Double;
+begin
+  for L := 0 to High(LENS) do
+  begin
+    // Positive values across many magnitudes, including the ln(x)~0 region.
+    SetLength(A, LENS[L]);
+    for I := 0 to High(A) do
+      A[I] := Power(10.0, -300.0 + 600.0 * Random);
+    SetLength(R, LENS[L]);
+    for E := 0 to High(FEngines) do
+    begin
+      FEngines[E].Log(A, R);
+      MaxErr := 0.0;
+      for I := 0 to High(A) do
+      begin
+        Err := RelErr(R[I], Ln(A[I]));
+        if Err > MaxErr then MaxErr := Err;
+      end;
+      Assert.IsTrue(MaxErr < 2e-14, Format(
+        '%s Log Len=%d: max err %.3g exceeds 2e-14',
+        [FNames[E], LENS[L], MaxErr]));
+    end;
+  end;
+end;
+
+Procedure TVectorMathTests.ExpWithSum_SumMatchesArray;
+// The fused Exp+Sum must return the sum of exactly the array it produced.
+var
+  E, L, I: Integer;
+  A, R: TArray<Double>;
+  S, Ref: Double;
+begin
+  for L := 0 to High(LENS) do
+  begin
+    A := RandomArray(LENS[L], -5.0, 5.0);
+    SetLength(R, LENS[L]);
+    for E := 0 to High(FEngines) do
+    begin
+      FEngines[E].Exp(A, R, S);
+      Ref := 0.0;
+      for I := 0 to High(R) do Ref := Ref + R[I];
+      Assert.IsTrue(Abs(S - Ref) <= 1e-12 * Ref, Format(
+        '%s Exp+Sum Len=%d: %.17g <> array sum %.17g',
+        [FNames[E], LENS[L], S, Ref]));
+    end;
+  end;
+end;
+
+Procedure TVectorMathTests.Exp_ScratchOverloadIdentical;
+// With/without explicit scratch must produce bit-identical results.
+var
+  E, I: Integer;
+  A, R1, R2: TArray<Double>;
+  Scratch: TScratchBuffer;
+begin
+  A := RandomArray(1000, -5.0, 5.0);
+  SetLength(R1, 1000);
+  SetLength(R2, 1000);
+  for E := 0 to High(FEngines) do
+  begin
+    FEngines[E].Exp(A, R1);
+    FEngines[E].Exp(A, R2, Scratch);
+    for I := 0 to High(A) do
+      Assert.IsTrue(R1[I] = R2[I], Format(
+        '%s scratch overload differs at i=%d', [FNames[E], I]));
+  end;
+end;
+
+initialization
+  TDUnitX.RegisterTestFixture(TVectorMathTests);
+
+end.
