@@ -36,15 +36,24 @@ allows. VecMath addresses all three:
 
 `TVectorMath` is the compute engine: element-wise operations (`Add`, `Subtract`,
 `Multiply`, `Divide`, `Sqrt`, `Exp`, `Log`, `Sum`, ...) plus accumulation
-primitives (dot product, scaled accumulate). At program start the global
-`Engine` variable is initialised with the best implementation the CPU supports:
+primitives (dot product, scaled accumulate) and masked exponential weighting
+(`ExpMoments`, `MultiplyByExp`). At program start the global `Engine` variable
+is initialised with the best implementation the CPU supports:
 
 ```pascal
 uses VecMath;
 
 Engine.Multiply(2.5, A, B);     // B[i] := 2.5 * A[i]
 Engine.Exp(U, E, SumExp);       // E[i] := exp(U[i]),  SumExp = Sum E[i]  (fused)
+M := Engine.ExpMoments(s, X, W);  // M.First  = Sum W[i]*X[i]*exp(s*X[i]),
+                                  // M.Second = Sum W[i]*X[i]^2*exp(s*X[i]), W[i] <> 0
+Engine.MultiplyByExp(s, X, V);  // V[i] := V[i]*exp(s*X[i]) where V[i] <> 0
 ```
+
+`ExpMoments` gives the function and derivative of a Newton-Raphson step on
+Sum W*X*exp(s*X) = Target, as in entropy maximization and Bregman balancing,
+and `MultiplyByExp` applies the step. Both skip the elements with zero weight
+or value without reading their X, so X may hold missing value codes there.
 
 The engine is **stateless and thread-safe**: any number of threads may share
 the one instance. Operations that need scratch memory have overloads taking a

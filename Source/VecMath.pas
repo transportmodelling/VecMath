@@ -19,6 +19,11 @@ Type
     Procedure EnsureSize(Len: Integer);
   end;
 
+  // The first and second moment of X weighted by W*exp(Scale*X), see ExpMoments
+  TExpMoments = record
+    First,Second: Double;
+  end;
+
   TVectorMath = class abstract
   strict protected
     // Range reduction constants of the scalar code. ln2 = LN2HI + LN2LO, where
@@ -56,6 +61,11 @@ Type
     // Whether every argument of a block lies within +-EXP_LIMIT; a NaN fails.
     // TVectorMathAVX overrides with a SIMD scan.
     Function ExpInRange(Count: Integer; V: PDouble): Boolean; virtual;
+    // Res[i] := Scale*X[i] where Mask[i] <> 0, else 0. X is masked before the
+    // multiplication, so any value of X where Mask[i] = 0 is harmless.
+    Procedure MaskedScaleBlock(const Scale: Double; Count: Integer; X, Mask, Res: PDouble); virtual;
+    // The moments of ExpMoments for one block, with E[i] = exp(Scale*X[i])
+    Function ExpMomentsBlock(Count: Integer; X, W, E: PDouble): TExpMoments; virtual;
     // Full ln pipeline for one block: Res[i] := ln(X[i]) for i < Count.
     // Base implementation runs reduce -> Horner through the virtuals above;
     // S and NLn2 are caller-provided workspace of at least Count elements.
@@ -80,6 +90,18 @@ Type
     Procedure Exp     (const Vector, Result: TArray<Double>; out Sum: Double; var Scratch: TScratchBuffer); overload; virtual;
     Procedure Log     (const Vector, Result: TArray<Double>); overload; virtual;
     Procedure Log     (const Vector, Result: TArray<Double>; var Scratch: TScratchBuffer); overload; virtual;
+    // Moments of X weighted by W*exp(Scale*X), over the elements with W[i] <> 0:
+    //   First  = Sum W[i]*X[i]*exp(Scale*X[i])
+    //   Second = Sum W[i]*X[i]^2*exp(Scale*X[i])
+    // which are the function and derivative of a Newton-Raphson step on
+    // Sum W[i]*X[i]*exp(Scale*X[i]) = Target. X and W have equal lengths; the X
+    // of an element with W[i] = 0 may hold any value, such as a missing value code.
+    Function ExpMoments(const Scale: Double; const X, W: TArray<Double>): TExpMoments; overload;
+    Function ExpMoments(const Scale: Double; const X, W: TArray<Double>; var Scratch: TScratchBuffer): TExpMoments; overload;
+    // InOut[i] := InOut[i]*exp(Scale*X[i]) where InOut[i] <> 0. X and InOut have
+    // equal lengths; the X of an element with InOut[i] = 0 may hold any value.
+    Procedure MultiplyByExp(const Scale: Double; const X, InOut: TArray<Double>); overload;
+    Procedure MultiplyByExp(const Scale: Double; const X, InOut: TArray<Double>; var Scratch: TScratchBuffer); overload;
     // Accumulation primitives.
     function SumBlock(Data: PDouble; Count: Integer): Double; virtual;
     // Dot product: Sum Data[i]*Weights[i].  Weights may contain exact zeros;
@@ -116,6 +138,29 @@ uses
 //   4 x Double arrays x 512 x 8 B = 16 KB  +  1 x Int64 array x 512 x 8 B = 4 KB
 Const
   EXP_LOG_BLOCK = 512;
+
+Type
+  // Steps through an array of Length elements in blocks of EXP_LOG_BLOCK
+  TBlocks = record
+    Start,Count,Length: Integer;
+    Constructor Create(ArrayLength: Integer);
+    Function Next: Boolean;
+  end;
+
+Constructor TBlocks.Create(ArrayLength: Integer);
+begin
+  Start := 0;
+  Count := 0;
+  Length := ArrayLength;
+end;
+
+Function TBlocks.Next: Boolean;
+begin
+  Inc(Start, Count);
+  Count := Length - Start;
+  if Count > EXP_LOG_BLOCK then Count := EXP_LOG_BLOCK;
+  Result := Count > 0;
+end;
 
 // ---------------------------------------------------------------------------
 // TScratchBuffer
@@ -550,6 +595,75 @@ begin
     ExpCore(Count, V, Res, Scratch)
   else
     for I := 0 to Count - 1 do Res[I] := System.Exp(V[I]);
+end;
+
+Procedure TVectorMath.MaskedScaleBlock(const Scale: Double; Count: Integer; X, Mask, Res: PDouble);
+var I: Integer;
+begin
+  for I := 0 to Count - 1 do
+    if Mask[I] <> 0.0 then Res[I] := Scale * X[I] else Res[I] := 0.0;
+end;
+
+Function TVectorMath.ExpMomentsBlock(Count: Integer; X, W, E: PDouble): TExpMoments;
+var I: Integer; T: Double;
+begin
+  Result := Default(TExpMoments);
+  for I := 0 to Count - 1 do
+    if W[I] <> 0.0 then
+    begin
+      T := W[I] * X[I] * E[I];
+      Result.First := Result.First + T;
+      Result.Second := Result.Second + T * X[I];
+    end;
+end;
+
+// ---------------------------------------------------------------------------
+// TVectorMath.ExpMoments and MultiplyByExp: per block, the masked arguments
+// Scale*X go to Scratch.FDouble[0] and their exponentials to FDouble[3]
+// ---------------------------------------------------------------------------
+
+Function TVectorMath.ExpMoments(const Scale: Double; const X, W: TArray<Double>): TExpMoments;
+var Scratch: TScratchBuffer;
+begin
+  Result := ExpMoments(Scale, X, W, Scratch);
+end;
+
+Function TVectorMath.ExpMoments(const Scale: Double; const X, W: TArray<Double>; var Scratch: TScratchBuffer): TExpMoments;
+var
+  Blocks: TBlocks;
+  Moments: TExpMoments;
+begin
+  Result := Default(TExpMoments);
+  Scratch.EnsureSize(EXP_LOG_BLOCK);
+  Blocks := TBlocks.Create(System.Length(X));
+  while Blocks.Next do
+  begin
+    MaskedScaleBlock(Scale, Blocks.Count, @X[Blocks.Start], @W[Blocks.Start], @Scratch.FDouble[0][0]);
+    ExpBlock(Blocks.Count, @Scratch.FDouble[0][0], @Scratch.FDouble[3][0], Scratch);
+    Moments := ExpMomentsBlock(Blocks.Count, @X[Blocks.Start], @W[Blocks.Start], @Scratch.FDouble[3][0]);
+    Result.First := Result.First + Moments.First;
+    Result.Second := Result.Second + Moments.Second;
+  end;
+end;
+
+Procedure TVectorMath.MultiplyByExp(const Scale: Double; const X, InOut: TArray<Double>);
+var Scratch: TScratchBuffer;
+begin
+  MultiplyByExp(Scale, X, InOut, Scratch);
+end;
+
+Procedure TVectorMath.MultiplyByExp(const Scale: Double; const X, InOut: TArray<Double>; var Scratch: TScratchBuffer);
+// An element with InOut[i] = 0 has argument 0 and factor 1
+var Blocks: TBlocks;
+begin
+  Scratch.EnsureSize(EXP_LOG_BLOCK);
+  Blocks := TBlocks.Create(System.Length(X));
+  while Blocks.Next do
+  begin
+    MaskedScaleBlock(Scale, Blocks.Count, @X[Blocks.Start], @InOut[Blocks.Start], @Scratch.FDouble[0][0]);
+    ExpBlock(Blocks.Count, @Scratch.FDouble[0][0], @Scratch.FDouble[3][0], Scratch);
+    MultiplyBlock(Blocks.Count, @Scratch.FDouble[3][0], @InOut[Blocks.Start]);
+  end;
 end;
 
 // ---------------------------------------------------------------------------

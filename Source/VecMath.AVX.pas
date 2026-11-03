@@ -19,6 +19,8 @@ type
   {$IF DEFINED(MSWINDOWS) AND DEFINED(CPUX64)}
   strict protected
     Function ExpInRange(Count: Integer; V: PDouble): Boolean; override;
+    Procedure MaskedScaleBlock(const Scale: Double; Count: Integer; X, Mask, Res: PDouble); override;
+    Function ExpMomentsBlock(Count: Integer; X, W, E: PDouble): TExpMoments; override;
   public
     Procedure Add     (const Scalar: Double; const Vector, Result: TArray<Double>); overload; override;
     Procedure Add     (const Left, Right, Result: TArray<Double>);                  overload; override;
@@ -508,6 +510,115 @@ var Tail: Integer;
 begin
   Tail := Count and 3;
   Result := AVXExpInRangeV(Count shr 2, V) and inherited ExpInRange(Tail, @V[Count - Tail]);
+end;
+
+// Res[i] := Scale*X[i] where Mask[i] <> 0, else 0, for QuadCount groups of 4.
+// X is ANDed with the mask before the multiplication, so a masked X, however
+// large or NaN, raises no floating point exception.
+// Win64: XMM0=Scale  EDX=QuadCount  R8=X  R9=Mask  stack=Res
+Procedure AVXMaskedScaleV(const Scale: Double; QuadCount: Integer; X, Mask, Res: PDouble);
+asm
+  TEST      EDX, EDX
+  JLE       @done
+  MOV       RAX, Res
+  VUNPCKLPD XMM0, XMM0, XMM0
+  VINSERTF128 YMM0, YMM0, XMM0, 1     // Scale in all lanes
+  VXORPD    YMM1, YMM1, YMM1
+@loop:
+  VCMPPD    YMM2, YMM1, [R9], 4       // NEQ_UQ: Mask <> 0
+  VANDPD    YMM2, YMM2, [R8]
+  VMULPD    YMM2, YMM2, YMM0
+  VMOVUPD   [RAX], YMM2
+  ADD       R8,  32
+  ADD       R9,  32
+  ADD       RAX, 32
+  DEC       EDX
+  JNZ       @loop
+@done:
+  VZEROUPPER
+end;
+
+Procedure TVectorMathAVX.MaskedScaleBlock(const Scale: Double; Count: Integer; X, Mask, Res: PDouble);
+var Tail: Integer;
+begin
+  Tail := Count and 3;
+  AVXMaskedScaleV(Scale, Count shr 2, X, Mask, Res);
+  inherited MaskedScaleBlock(Scale, Tail, @X[Count - Tail], @Mask[Count - Tail], @Res[Count - Tail]);
+end;
+
+// Moments over QuadCount groups of 4: Sums[0] := Sum W*X*E, Sums[1] := Sum W*X^2*E
+// for W <> 0. X is ANDed with the mask W <> 0 first, so a masked X contributes
+// an exact zero. Two streams of two accumulators hide the VADDPD latency.
+// Win64: ECX=QuadCount  RDX=X  R8=W  R9=E  stack=Sums (2 doubles)
+Procedure AVXExpMomentsV(QuadCount: Integer; X, W, E, Sums: PDouble);
+asm
+  VXORPD    YMM0, YMM0, YMM0          // first moment, stream a
+  VXORPD    YMM1, YMM1, YMM1          // first moment, stream b
+  VXORPD    YMM2, YMM2, YMM2          // second moment, stream a
+  VXORPD    YMM3, YMM3, YMM3          // second moment, stream b
+  MOV       EAX, ECX
+  SHR       EAX, 1
+  JZ        @rest
+@loop2:
+  VXORPD    YMM5, YMM5, YMM5
+  VCMPPD    YMM5, YMM5, [R8], 4       // NEQ_UQ: W <> 0
+  VANDPD    YMM5, YMM5, [RDX]         // masked X
+  VMULPD    YMM4, YMM5, [R8]
+  VMULPD    YMM4, YMM4, [R9]          // T = X*W*E
+  VADDPD    YMM0, YMM0, YMM4
+  VMULPD    YMM4, YMM4, YMM5
+  VADDPD    YMM2, YMM2, YMM4
+  VXORPD    YMM5, YMM5, YMM5
+  VCMPPD    YMM5, YMM5, [R8+32], 4
+  VANDPD    YMM5, YMM5, [RDX+32]
+  VMULPD    YMM4, YMM5, [R8+32]
+  VMULPD    YMM4, YMM4, [R9+32]
+  VADDPD    YMM1, YMM1, YMM4
+  VMULPD    YMM4, YMM4, YMM5
+  VADDPD    YMM3, YMM3, YMM4
+  ADD       RDX, 64
+  ADD       R8,  64
+  ADD       R9,  64
+  DEC       EAX
+  JNZ       @loop2
+@rest:
+  AND       ECX, 1
+  JZ        @reduce
+  VXORPD    YMM5, YMM5, YMM5
+  VCMPPD    YMM5, YMM5, [R8], 4
+  VANDPD    YMM5, YMM5, [RDX]
+  VMULPD    YMM4, YMM5, [R8]
+  VMULPD    YMM4, YMM4, [R9]
+  VADDPD    YMM0, YMM0, YMM4
+  VMULPD    YMM4, YMM4, YMM5
+  VADDPD    YMM2, YMM2, YMM4
+@reduce:
+  VADDPD    YMM0, YMM0, YMM1
+  VEXTRACTF128 XMM1, YMM0, 1
+  VADDPD    XMM0, XMM0, XMM1
+  VUNPCKHPD XMM1, XMM0, XMM0
+  VADDSD    XMM0, XMM0, XMM1
+  VADDPD    YMM2, YMM2, YMM3
+  VEXTRACTF128 XMM3, YMM2, 1
+  VADDPD    XMM2, XMM2, XMM3
+  VUNPCKHPD XMM3, XMM2, XMM2
+  VADDSD    XMM2, XMM2, XMM3
+  MOV       RAX, Sums
+  VMOVSD    [RAX],   XMM0
+  VMOVSD    [RAX+8], XMM2
+  VZEROUPPER
+end;
+
+Function TVectorMathAVX.ExpMomentsBlock(Count: Integer; X, W, E: PDouble): TExpMoments;
+var
+  Tail: Integer;
+  Moments: TExpMoments;
+begin
+  Tail := Count and 3;
+  AVXExpMomentsV(Count shr 2, X, W, E, @Result.First);
+  Moments := inherited ExpMomentsBlock(Tail, @X[Count - Tail], @W[Count - Tail], @E[Count - Tail]);
+  Result.First := Result.First + Moments.First;
+  Result.Second := Result.Second + Moments.Second;
 end;
 
 // In-place multiply: InOut[i] *= Src[i], 4 doubles per iteration.

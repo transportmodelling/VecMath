@@ -52,6 +52,9 @@ type
     [Test] Procedure Exp_BeyondLimit_MatchesSystemExp;
     [Test] Procedure Exp_UnderflowAnywhere_GivesZero;
     [Test] Procedure Exp_Overflow_LikeSystemExp;
+    [Test] Procedure ExpMoments_MatchesNaiveReference;
+    [Test] Procedure ExpMoments_BeyondLimit_MatchesNaiveReference;
+    [Test] Procedure MultiplyByExp_MatchesSystemExp;
   end;
 
 implementation
@@ -407,6 +410,111 @@ begin
         end, EOverflow, FNames[E]);
   finally
     SetExceptionMask(Mask);
+  end;
+end;
+
+// Weights with exact zeros at every third element, where X holds values that
+// must not be used: a huge value, an infinity and a NaN
+Procedure MaskEveryThird(const X, W: TArray<Double>);
+var I: Integer;
+begin
+  for I := 0 to High(W) do
+    if I mod 3 = 0 then
+    begin
+      W[I] := 0.0;
+      case (I div 3) mod 3 of
+        0: X[I] := MaxDouble;
+        1: X[I] := Infinity;
+        else X[I] := NaN;
+      end;
+    end;
+end;
+
+// Sum W*X*exp(Scale*X) and Sum W*X^2*exp(Scale*X) over W <> 0, with System.Exp
+Function NaiveExpMoments(const Scale: Double; const X, W: TArray<Double>): TExpMoments;
+var I: Integer; T: Double;
+begin
+  Result := Default(TExpMoments);
+  for I := 0 to High(X) do
+    if W[I] <> 0.0 then
+    begin
+      T := W[I] * X[I] * System.Exp(Scale * X[I]);
+      Result.First := Result.First + T;
+      Result.Second := Result.Second + T * X[I];
+    end;
+end;
+
+Procedure TVectorMathTests.ExpMoments_MatchesNaiveReference;
+// Accumulation order differs between implementations, so compare with a tolerance
+var
+  E, L: Integer;
+  X, W: TArray<Double>;
+  Ref, M: TExpMoments;
+begin
+  for L := 0 to High(LENS) do
+  begin
+    X := RandomArray(LENS[L], -5.0, 5.0);
+    W := RandomArray(LENS[L], 0.5, 2.0);
+    MaskEveryThird(X, W);
+    Ref := NaiveExpMoments(0.37, X, W);
+    for E := 0 to High(FEngines) do
+    begin
+      M := FEngines[E].ExpMoments(0.37, X, W);
+      Assert.IsTrue(RelErr(M.First, Ref.First) <= 1e-12, Format('%s ExpMoments.First Len=%d: %.17g <> ref %.17g',
+                                                                  [FNames[E], LENS[L], M.First, Ref.First]));
+      Assert.IsTrue(RelErr(M.Second, Ref.Second) <= 1e-12, Format('%s ExpMoments.Second Len=%d: %.17g <> ref %.17g',
+                                                                    [FNames[E], LENS[L], M.Second, Ref.Second]));
+    end;
+  end;
+end;
+
+Procedure TVectorMathTests.ExpMoments_BeyondLimit_MatchesNaiveReference;
+// Arguments down to -1000, where System.Exp underflows to a denormal or zero
+var
+  E, L: Integer;
+  X, W: TArray<Double>;
+  Ref, M: TExpMoments;
+begin
+  for L := 0 to High(LENS) do
+  begin
+    X := RandomArray(LENS[L], -5.0, 3.0);
+    W := RandomArray(LENS[L], 0.5, 2.0);
+    MaskEveryThird(X, W);
+    Ref := NaiveExpMoments(200.0, X, W);
+    for E := 0 to High(FEngines) do
+    begin
+      M := FEngines[E].ExpMoments(200.0, X, W);
+      Assert.IsTrue(Abs(M.First - Ref.First) <= 1e-12 * Max(1.0, Abs(Ref.First)), Format(
+        '%s ExpMoments.First Len=%d: %.17g <> ref %.17g', [FNames[E], LENS[L], M.First, Ref.First]));
+      Assert.IsTrue(Abs(M.Second - Ref.Second) <= 1e-12 * Max(1.0, Abs(Ref.Second)), Format(
+        '%s ExpMoments.Second Len=%d: %.17g <> ref %.17g', [FNames[E], LENS[L], M.Second, Ref.Second]));
+    end;
+  end;
+end;
+
+Procedure TVectorMathTests.MultiplyByExp_MatchesSystemExp;
+// A zero element stays exactly zero, whatever its X
+var
+  E, L, I: Integer;
+  X, W, R: TArray<Double>;
+  Ref: Double;
+begin
+  for L := 0 to High(LENS) do
+  begin
+    X := RandomArray(LENS[L], -5.0, 5.0);
+    W := RandomArray(LENS[L], 0.5, 2.0);
+    MaskEveryThird(X, W);
+    for E := 0 to High(FEngines) do
+    begin
+      R := Copy(W);
+      FEngines[E].MultiplyByExp(0.37, X, R);
+      for I := 0 to High(R) do
+      begin
+        if W[I] <> 0.0 then Ref := W[I] * System.Exp(0.37 * X[I]) else Ref := 0.0;
+        Assert.IsTrue((R[I] = Ref) or (Abs(R[I] - Ref) <= 2e-14 * Ref), Format(
+          '%s MultiplyByExp Len=%d i=%d: %.17g <> %.17g', [FNames[E], LENS[L], I, R[I], Ref]));
+      end;
+    end;
   end;
 end;
 
