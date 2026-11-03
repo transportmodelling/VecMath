@@ -754,10 +754,6 @@ Procedure TVectorMathAVX2.ExpCore(Count: Integer; V, Res: PDouble;
   var Scratch: TScratchBuffer);
 // Scratch is unused here: the fused kernel keeps all intermediates in
 // registers and the scalar tail (0-3 elements) uses locals only.
-const
-  LOG2E = 1.4426950408889634;
-  LN2HI = 6.93147180369123816490e-1;
-  LN2LO = 1.90821492927058770002e-10;
 var
   QuadCount, Tail, I: Integer;
   Ri, Pi, TwoN: Double;
@@ -1075,9 +1071,6 @@ end;
 Procedure TVectorMathAVX2.LogCore(Count: Integer; X, Res, S, NLn2: PDouble);
 // S and NLn2 are unused here: the fused kernel keeps all intermediates in
 // registers and the scalar tail (0-3 elements) uses locals only.
-const
-  LN2   = 6.93147180559945309417e-1;
-  SQRT2 = 1.41421356237309504880e0;
 var
   QuadCount, Tail, I, NI: Integer;
   Bits: Int64;

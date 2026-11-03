@@ -21,6 +21,19 @@ Type
 
   TVectorMath = class abstract
   strict protected
+    // Range reduction constants of the scalar code. ln2 = LN2HI + LN2LO, where
+    // LN2HI has trailing mantissa bits zero so that n*LN2HI is exact (fdlibm).
+    // The literals round to the intended doubles, so the warning on that
+    // rounding is off.
+    {$WARN LOST_EXTENDED_PRECISION OFF}
+    const
+      LOG2E = 1.4426950408889634;
+      LN2HI = 6.93147180369123816490e-1;
+      LN2LO = 1.90821492927058770002e-10;
+      LN2   = 6.93147180559945309417e-1;
+      SQRT2 = 1.41421356237309504880e0;
+    {$WARN LOST_EXTENDED_PRECISION ON}
+  strict protected
     // Hardware-dispatch hooks - overridden by SIMD subclasses.
     Procedure ExpReduce (QuadCount: Integer; V, R: PDouble; N: PInt64); virtual;
     Procedure ExpRecon  (QuadCount: Integer; P: PDouble; N: PInt64; Res: PDouble); virtual;
@@ -112,10 +125,6 @@ end;
 // ---------------------------------------------------------------------------
 
 Procedure TVectorMath.ExpReduce(QuadCount: Integer; V, R: PDouble; N: PInt64);
-const
-  LOG2E = 1.4426950408889634;
-  LN2HI = 6.93147180369123816490e-1;
-  LN2LO = 1.90821492927058770002e-10;
 var I, Count: Integer;
 begin
   Count := QuadCount * 4;
@@ -142,9 +151,6 @@ begin
 end;
 
 Procedure TVectorMath.LogReduce(QuadCount: Integer; V, S, NLn2: PDouble);
-const
-  LN2   = 6.93147180559945309417e-1;
-  SQRT2 = 1.41421356237309504880e0;
 var
   I, Count, NI: Integer;
   Bits: Int64;
@@ -452,9 +458,6 @@ end;
 Procedure TVectorMath.LogCore(Count: Integer; X, Res, S, NLn2: PDouble);
 // Two-pass ln pipeline: argument reduction then Horner, each dispatching to
 // the subclass virtuals.  S and NLn2 are workspace of at least Count elements.
-const
-  LN2   = 6.93147180559945309417e-1;
-  SQRT2 = 1.41421356237309504880e0;
 var
   FullQuads, TailStart, I, NI: Integer;
   Bits: Int64;
@@ -487,10 +490,6 @@ Procedure TVectorMath.ExpCore(Count: Integer; V, Res: PDouble;
   var Scratch: TScratchBuffer);
 // Three-pass exp pipeline: reduce -> Horner -> reconstruct, each dispatching to
 // the subclass virtuals.  Uses FDouble[1] as R, FDouble[2] as P, FInt64 as N.
-const
-  LOG2E = 1.4426950408889634;
-  LN2HI = 6.93147180369123816490e-1;
-  LN2LO = 1.90821492927058770002e-10;
 var
   FullQuads, TailStart, I: Integer;
   R, P: TArray<Double>;
