@@ -84,9 +84,11 @@ implementation.
 
 ## Accuracy
 
-- `Exp`: degree-12 polynomial after range reduction, ~1-2 ulp for |x| < 709
-  (the full finite-result range of double). No special handling of NaN/+/-Inf
-  inputs.
+- `Exp`: degree-12 polynomial after range reduction, ~1-2 ulp for |x| <= 708.
+  A block of 512 values with an argument beyond that, or a NaN, is computed
+  with `System.Exp`, so overflow, underflow to a denormal or zero and NaN
+  behave exactly as in the RTL: +Inf or `EOverflow` depending on the exception
+  mask.
 - `Log`: polynomial after mantissa/exponent split, ~1 ulp for positive finite
   inputs. Zero or negative inputs produce garbage rather than +/-Inf/NaN - the
   caller is responsible for keeping inputs positive.

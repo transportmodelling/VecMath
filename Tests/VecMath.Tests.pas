@@ -49,6 +49,9 @@ type
     [Test] Procedure Log_MatchesSystemLn;
     [Test] Procedure ExpWithSum_SumMatchesArray;
     [Test] Procedure Exp_ScratchOverloadIdentical;
+    [Test] Procedure Exp_BeyondLimit_MatchesSystemExp;
+    [Test] Procedure Exp_UnderflowAnywhere_GivesZero;
+    [Test] Procedure Exp_Overflow_LikeSystemExp;
   end;
 
 implementation
@@ -308,6 +311,102 @@ begin
     for I := 0 to High(A) do
       Assert.IsTrue(R1[I] = R2[I], Format(
         '%s scratch overload differs at i=%d', [FNames[E], I]));
+  end;
+end;
+
+Procedure TVectorMathTests.Exp_BeyondLimit_MatchesSystemExp;
+// Arguments down to the denormal range and up to the largest finite result.
+// A normal result matches System.Exp within the usual tolerance; a block with
+// an argument beyond the limit takes System.Exp itself, so a denormal or zero
+// result matches it exactly.
+const
+  MIN_NORMAL = 2.2250738585072014e-308;
+var
+  E, L, I: Integer;
+  A, R: TArray<Double>;
+  Ref, MaxErr, Err: Double;
+begin
+  for L := 0 to High(LENS) do
+  begin
+    A := RandomArray(LENS[L], -745.0, 709.7);
+    SetLength(R, LENS[L]);
+    for E := 0 to High(FEngines) do
+    begin
+      FEngines[E].Exp(A, R);
+      MaxErr := 0.0;
+      for I := 0 to High(A) do
+      begin
+        Ref := System.Exp(A[I]);
+        if Ref >= MIN_NORMAL then
+        begin
+          Err := Abs(R[I] - Ref) / Ref;
+          if Err > MaxErr then MaxErr := Err;
+        end else
+          Assert.IsTrue(R[I] = Ref, Format('%s Exp Len=%d i=%d: %.17g <> %.17g',
+                                           [FNames[E], LENS[L], I, R[I], Ref]));
+      end;
+      Assert.IsTrue(MaxErr < 2e-14, Format(
+        '%s Exp Len=%d: max rel err %.3g exceeds 2e-14',
+        [FNames[E], LENS[L], MaxErr]));
+    end;
+  end;
+end;
+
+Procedure TVectorMathTests.Exp_UnderflowAnywhere_GivesZero;
+// One argument far below the limit, at the start, in the middle or in the
+// scalar tail of an array: the range check must see it wherever it is.
+var
+  E, L, P, Pos: Integer;
+  A, R: TArray<Double>;
+begin
+  for L := 0 to High(LENS) do
+  for P := 0 to 2 do
+  begin
+    A := RandomArray(LENS[L], -5.0, 5.0);
+    case P of
+      0: Pos := 0;
+      1: Pos := LENS[L] div 2;
+      else Pos := LENS[L] - 1;
+    end;
+    A[Pos] := -800.0;
+    SetLength(R, LENS[L]);
+    for E := 0 to High(FEngines) do
+    begin
+      FEngines[E].Exp(A, R);
+      Assert.IsTrue(R[Pos] = 0.0, Format('%s Exp Len=%d i=%d: %.17g <> 0',
+                                         [FNames[E], LENS[L], Pos, R[Pos]]));
+    end;
+  end;
+end;
+
+Procedure TVectorMathTests.Exp_Overflow_LikeSystemExp;
+// Exp(710) overflows as System.Exp does: +Inf with the overflow exception
+// masked, the default, and EOverflow with it unmasked
+var
+  E: Integer;
+  A, R: TArray<Double>;
+  Mask: TArithmeticExceptionMask;
+begin
+  A := RandomArray(100, -5.0, 5.0);
+  A[37] := 710.0;
+  SetLength(R, 100);
+  Mask := GetExceptionMask;
+  try
+    SetExceptionMask(Mask + [exOverflow]);
+    for E := 0 to High(FEngines) do
+    begin
+      FEngines[E].Exp(A, R);
+      Assert.IsTrue(IsInfinite(R[37]) and (R[37] > 0), Format('%s Exp(710): %.17g', [FNames[E], R[37]]));
+    end;
+    SetExceptionMask(Mask - [exOverflow]);
+    for E := 0 to High(FEngines) do
+      Assert.WillRaise(
+        Procedure
+        begin
+          FEngines[E].Exp(A, R);
+        end, EOverflow, FNames[E]);
+  finally
+    SetExceptionMask(Mask);
   end;
 end;
 

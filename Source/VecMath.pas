@@ -33,6 +33,12 @@ Type
       LN2   = 6.93147180559945309417e-1;
       SQRT2 = 1.41421356237309504880e0;
     {$WARN LOST_EXTENDED_PRECISION ON}
+    // ExpCore is accurate for |x| <= EXP_LIMIT. Beyond it, 2^n leaves the
+    // exponent range of a double and the reconstruction yields garbage.
+    const
+      EXP_LIMIT = 708.0;
+  strict private
+    Procedure ExpBlock(Count: Integer; V, Res: PDouble; var Scratch: TScratchBuffer);
   strict protected
     // Hardware-dispatch hooks - overridden by SIMD subclasses.
     Procedure ExpReduce (QuadCount: Integer; V, R: PDouble; N: PInt64); virtual;
@@ -47,6 +53,9 @@ Type
     // all intermediates in registers and does not touch scratch memory at all.
     Procedure ExpCore(Count: Integer; V, Res: PDouble;
       var Scratch: TScratchBuffer); virtual;
+    // Whether every argument of a block lies within +-EXP_LIMIT; a NaN fails.
+    // TVectorMathAVX overrides with a SIMD scan.
+    Function ExpInRange(Count: Integer; V: PDouble): Boolean; virtual;
     // Full ln pipeline for one block: Res[i] := ln(X[i]) for i < Count.
     // Base implementation runs reduce -> Horner through the virtuals above;
     // S and NLn2 are caller-provided workspace of at least Count elements.
@@ -372,9 +381,10 @@ Procedure TVectorMath.Exp(const Vector, Result: TArray<Double>; var Scratch: TSc
 // Cache-blocked polynomial exp(x) = 2^n * exp(r),  n = round(x/ln2),  |r| <= ln2/2
 //
 // Each block fits in L1 cache, so all pipeline stages hit L1 rather than
-// making separate passes through main memory.  Accuracy: ~1-2 ULP for |x| < 710.
+// making separate passes through main memory.  Accuracy: ~1-2 ULP.
 //
-// ExpCore dispatches to the subclass (fused SIMD or scalar three-pass).
+// ExpBlock dispatches to the subclass (fused SIMD or scalar three-pass), or to
+// System.Exp for a block with an argument beyond +-EXP_LIMIT.
 var
   Len, BlockStart, BlockLen: Integer;
 begin
@@ -387,7 +397,7 @@ begin
   begin
     BlockLen := Len - BlockStart;
     if BlockLen > EXP_LOG_BLOCK then BlockLen := EXP_LOG_BLOCK;
-    ExpCore(BlockLen, @Vector[BlockStart], @Result[BlockStart], Scratch);
+    ExpBlock(BlockLen, @Vector[BlockStart], @Result[BlockStart], Scratch);
     Inc(BlockStart, EXP_LOG_BLOCK);
   end;
 end;
@@ -414,7 +424,7 @@ begin
   begin
     BlockLen := Len - BlockStart;
     if BlockLen > EXP_LOG_BLOCK then BlockLen := EXP_LOG_BLOCK;
-    ExpCore(BlockLen, @Vector[BlockStart], @Result[BlockStart], Scratch);
+    ExpBlock(BlockLen, @Vector[BlockStart], @Result[BlockStart], Scratch);
     Sum := Sum + SumBlock(@Result[BlockStart], BlockLen);
     Inc(BlockStart, EXP_LOG_BLOCK);
   end;
@@ -521,6 +531,25 @@ begin
     PInt64(@TwoN)^ := NI shl 52;
     Res[I] := P[I] * TwoN;
   end;
+end;
+
+Function TVectorMath.ExpInRange(Count: Integer; V: PDouble): Boolean;
+var I: Integer;
+begin
+  for I := 0 to Count - 1 do
+    if not (Abs(V[I]) <= EXP_LIMIT) then Exit(false);
+  Result := true;
+end;
+
+Procedure TVectorMath.ExpBlock(Count: Integer; V, Res: PDouble; var Scratch: TScratchBuffer);
+// Beyond the range of ExpCore, System.Exp overflows, underflows to a denormal
+// or zero, or passes a NaN, as the RTL does
+var I: Integer;
+begin
+  if ExpInRange(Count, V) then
+    ExpCore(Count, V, Res, Scratch)
+  else
+    for I := 0 to Count - 1 do Res[I] := System.Exp(V[I]);
 end;
 
 // ---------------------------------------------------------------------------

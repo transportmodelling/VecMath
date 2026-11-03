@@ -17,6 +17,8 @@ uses
 type
   TVectorMathAVX = class(TVectorMath)
   {$IF DEFINED(MSWINDOWS) AND DEFINED(CPUX64)}
+  strict protected
+    Function ExpInRange(Count: Integer; V: PDouble): Boolean; override;
   public
     Procedure Add     (const Scalar: Double; const Vector, Result: TArray<Double>); overload; override;
     Procedure Add     (const Left, Right, Result: TArray<Double>);                  overload; override;
@@ -469,6 +471,43 @@ begin
   else Result := 0.0;
   for I := Count - Tail to Count - 1 do
     Result := Result + Data[I] * Weights[I];
+end;
+
+// Whether |v| <= 708 (TVectorMath.EXP_LIMIT) for QuadCount groups of 4 doubles;
+// a NaN fails. A lane fails when |v| is not <= 708 (NLE_UQ, true for a NaN),
+// and the failures are ORed, a one-cycle chain, so the scan runs at load speed.
+// Win64: RCX=QuadCount  RDX=V  -> AL
+Function AVXExpInRangeV(QuadCount: Integer; V: PDouble): Boolean;
+asm
+  MOV       RAX, $7FFFFFFFFFFFFFFF   // clears the sign bit: |v|
+  VMOVQ     XMM2, RAX
+  VUNPCKLPD XMM2, XMM2, XMM2
+  VINSERTF128 YMM2, YMM2, XMM2, 1
+  MOV       RAX, $4086200000000000   // 708.0
+  VMOVQ     XMM3, RAX
+  VUNPCKLPD XMM3, XMM3, XMM3
+  VINSERTF128 YMM3, YMM3, XMM3, 1
+  VXORPD    YMM0, YMM0, YMM0          // failed lanes
+  TEST      ECX, ECX
+  JLE       @check
+@loop:
+  VANDPD    YMM1, YMM2, [RDX]
+  VCMPPD    YMM1, YMM1, YMM3, 22      // NLE_UQ
+  VORPD     YMM0, YMM0, YMM1
+  ADD       RDX, 32
+  DEC       ECX
+  JNZ       @loop
+@check:
+  VTESTPD   YMM0, YMM0                // ZF = 1 when no lane failed
+  SETZ      AL
+  VZEROUPPER
+end;
+
+Function TVectorMathAVX.ExpInRange(Count: Integer; V: PDouble): Boolean;
+var Tail: Integer;
+begin
+  Tail := Count and 3;
+  Result := AVXExpInRangeV(Count shr 2, V) and inherited ExpInRange(Tail, @V[Count - Tail]);
 end;
 
 // In-place multiply: InOut[i] *= Src[i], 4 doubles per iteration.
