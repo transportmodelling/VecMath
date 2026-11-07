@@ -22,6 +22,7 @@ Type
   // The first and second moment of X weighted by W*exp(Scale*X), see ExpMoments
   TExpMoments = record
     First,Second: Double;
+    Procedure Add(const Moments: TExpMoments);
   end;
 
   TVectorMath = class abstract
@@ -45,6 +46,15 @@ Type
   strict private
     Procedure ExpBlock(Count: Integer; V, Res: PDouble; var Scratch: TScratchBuffer);
   strict protected
+    // The scalar steps of exp and ln for one element, which every scalar path
+    // and the scalar tails of the SIMD subclasses share, so they round alike:
+    // exp(x) = 2^n * p(r) with x = n*ln2 + r, and ln(x) = n*ln2 + s*g(s^2)
+    // with x = 2^n * m and s = (m-1)/(m+1).
+    Function ExpReduction(const X: Double; out N: Int64): Double; inline;
+    Function ExpPolynomial(const R: Double): Double; inline;
+    Function PowerOfTwo(const N: Int64): Double; inline;
+    Function LogReduction(const X: Double; out NLn2: Double): Double; inline;
+    Function LogPolynomial(const S: Double): Double; inline;
     // Hardware-dispatch hooks - overridden by SIMD subclasses.
     Procedure ExpReduce (QuadCount: Integer; V, R: PDouble; N: PInt64); virtual;
     Procedure ExpRecon  (QuadCount: Integer; P: PDouble; N: PInt64; Res: PDouble); virtual;
@@ -175,52 +185,101 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
+// TExpMoments
+// ---------------------------------------------------------------------------
+
+Procedure TExpMoments.Add(const Moments: TExpMoments);
+begin
+  First := First + Moments.First;
+  Second := Second + Moments.Second;
+end;
+
+// ---------------------------------------------------------------------------
+// TVectorMath - the scalar steps of exp and ln for one element
+// ---------------------------------------------------------------------------
+
+Function TVectorMath.ExpReduction(const X: Double; out N: Int64): Double;
+// r = x - n*ln2 with n = round(x/ln2), so |r| <= ln2/2
+begin
+  N := System.Round(X * LOG2E);
+  Result := (X - N * LN2HI) - N * LN2LO;
+end;
+
+Function TVectorMath.ExpPolynomial(const R: Double): Double;
+// Degree-12 Taylor: truncation error r^13/13! ~ 1.7e-16 at |r| = ln2/2, so the
+// polynomial itself contributes ~1 ulp.  (Degree 10 looked sufficient but its
+// truncation error is ~2e-13 - caught by Exp_MatchesSystemExp.)
+begin
+  Result := R * (1.0/479001600.0) + (1.0/39916800.0);
+  Result := R * Result + (1.0/3628800.0);
+  Result := R * Result + (1.0/362880.0);
+  Result := R * Result + (1.0/40320.0);
+  Result := R * Result + (1.0/5040.0);
+  Result := R * Result + (1.0/720.0);
+  Result := R * Result + (1.0/120.0);
+  Result := R * Result + (1.0/24.0);
+  Result := R * Result + (1.0/6.0);
+  Result := R * Result + 0.5;
+  Result := R * Result + 1.0;
+  Result := R * Result + 1.0;
+end;
+
+Function TVectorMath.PowerOfTwo(const N: Int64): Double;
+// 2^n, written into the exponent field
+begin
+  PInt64(@Result)^ := (N + 1023) shl 52;
+end;
+
+Function TVectorMath.LogReduction(const X: Double; out NLn2: Double): Double;
+// s = (m-1)/(m+1) and n*ln2 for x = 2^n * m, m in [sqrt(2)/2, sqrt(2))
+var
+  Bits: Int64;
+  NI: Integer;
+  M: Double;
+begin
+  Bits := PInt64(@X)^;
+  NI   := Integer((Bits shr 52) and $7FF) - 1023;
+  PInt64(@M)^ := (Bits and $000FFFFFFFFFFFFF) or $3FF0000000000000;
+  if M >= SQRT2 then begin M := M * 0.5; Inc(NI); end;
+  Result := (M - 1.0) / (M + 1.0);
+  NLn2 := NI * LN2;
+end;
+
+Function TVectorMath.LogPolynomial(const S: Double): Double;
+// s*g(s^2) with g(t) = 2 + 2t/3 + 2t^2/5 + ... + 2t^7/15
+var T: Double;
+begin
+  T := S * S;
+  Result := T * (2.0/15.0) + (2.0/13.0);
+  Result := T * Result + (2.0/11.0);
+  Result := T * Result + (2.0/9.0);
+  Result := T * Result + (2.0/7.0);
+  Result := T * Result + (2.0/5.0);
+  Result := T * Result + (2.0/3.0);
+  Result := T * Result + 2.0;
+  Result := S * Result;
+end;
+
+// ---------------------------------------------------------------------------
 // TVectorMath - scalar reduce/recon hooks (base-class defaults)
 // ---------------------------------------------------------------------------
 
 Procedure TVectorMath.ExpReduce(QuadCount: Integer; V, R: PDouble; N: PInt64);
-var I, Count: Integer;
+var I: Integer;
 begin
-  Count := QuadCount * 4;
-  for I := 0 to Count - 1 do
-  begin
-    N[I] := System.Round(V[I] * LOG2E);
-    R[I] := (V[I] - N[I] * LN2HI) - N[I] * LN2LO;
-  end;
+  for I := 0 to QuadCount * 4 - 1 do R[I] := ExpReduction(V[I], N[I]);
 end;
 
 Procedure TVectorMath.ExpRecon(QuadCount: Integer; P: PDouble; N: PInt64; Res: PDouble);
-var
-  I, Count: Integer;
-  TwoN: Double;
-  NI: Int64;
+var I: Integer;
 begin
-  Count := QuadCount * 4;
-  for I := 0 to Count - 1 do
-  begin
-    NI := N[I] + 1023;
-    PInt64(@TwoN)^ := NI shl 52;
-    Res[I] := P[I] * TwoN;
-  end;
+  for I := 0 to QuadCount * 4 - 1 do Res[I] := P[I] * PowerOfTwo(N[I]);
 end;
 
 Procedure TVectorMath.LogReduce(QuadCount: Integer; V, S, NLn2: PDouble);
-var
-  I, Count, NI: Integer;
-  Bits: Int64;
-  M: Double;
+var I: Integer;
 begin
-  Count := QuadCount * 4;
-  for I := 0 to Count - 1 do
-  begin
-    Bits := PInt64(@V[I])^;
-    NI   := Integer((Bits shr 52) and $7FF) - 1023;
-    M    := V[I];
-    PInt64(@M)^ := (Bits and $000FFFFFFFFFFFFF) or $3FF0000000000000;
-    if M >= SQRT2 then begin M := M * 0.5; Inc(NI); end;
-    S[I]    := (M - 1.0) / (M + 1.0);
-    NLn2[I] := NI * LN2;
-  end;
+  for I := 0 to QuadCount * 4 - 1 do S[I] := LogReduction(V[I], NLn2[I]);
 end;
 
 // ---------------------------------------------------------------------------
@@ -300,46 +359,15 @@ begin
 end;
 
 Procedure TVectorMath.ExpHorner(Count: Integer; R, P: PDouble);
-// Degree-12 Taylor: truncation error r^13/13! ~ 1.7e-16 at |r| = ln2/2, so the
-// polynomial itself contributes ~1 ulp.  (Degree 10 looked sufficient but its
-// truncation error is ~2e-13 - caught by Exp_MatchesSystemExp.)
-var I: Integer; Ri, Pi: Double;
+var I: Integer;
 begin
-  for I := 0 to Count - 1 do
-  begin
-    Ri := R[I];
-    Pi := Ri * (1.0/479001600.0) + (1.0/39916800.0);
-    Pi := Ri * Pi + (1.0/3628800.0);
-    Pi := Ri * Pi + (1.0/362880.0);
-    Pi := Ri * Pi + (1.0/40320.0);
-    Pi := Ri * Pi + (1.0/5040.0);
-    Pi := Ri * Pi + (1.0/720.0);
-    Pi := Ri * Pi + (1.0/120.0);
-    Pi := Ri * Pi + (1.0/24.0);
-    Pi := Ri * Pi + (1.0/6.0);
-    Pi := Ri * Pi + 0.5;
-    Pi := Ri * Pi + 1.0;
-    Pi := Ri * Pi + 1.0;
-    P[I] := Pi;
-  end;
+  for I := 0 to Count - 1 do P[I] := ExpPolynomial(R[I]);
 end;
 
 Procedure TVectorMath.LogHorner(Count: Integer; S, NLn2, Res: PDouble);
-var I: Integer; Si, Ti, Pi: Double;
+var I: Integer;
 begin
-  for I := 0 to Count - 1 do
-  begin
-    Si := S[I];
-    Ti := Si * Si;
-    Pi := Ti * (2.0/15.0) + (2.0/13.0);
-    Pi := Ti * Pi + (2.0/11.0);
-    Pi := Ti * Pi + (2.0/9.0);
-    Pi := Ti * Pi + (2.0/7.0);
-    Pi := Ti * Pi + (2.0/5.0);
-    Pi := Ti * Pi + (2.0/3.0);
-    Pi := Ti * Pi + 2.0;
-    Res[I] := Si * Pi + NLn2[I];
-  end;
+  for I := 0 to Count - 1 do Res[I] := LogPolynomial(S[I]) + NLn2[I];
 end;
 
 function TVectorMath.SumBlock(Data: PDouble; Count: Integer): Double;
@@ -430,21 +458,12 @@ Procedure TVectorMath.Exp(const Vector, Result: TArray<Double>; var Scratch: TSc
 //
 // ExpBlock dispatches to the subclass (fused SIMD or scalar three-pass), or to
 // System.Exp for a block with an argument beyond +-EXP_LIMIT.
-var
-  Len, BlockStart, BlockLen: Integer;
+var Blocks: TBlocks;
 begin
-  Len := Length(Vector);
-  if Len = 0 then Exit;
   Scratch.EnsureSize(EXP_LOG_BLOCK);
-
-  BlockStart := 0;
-  while BlockStart < Len do
-  begin
-    BlockLen := Len - BlockStart;
-    if BlockLen > EXP_LOG_BLOCK then BlockLen := EXP_LOG_BLOCK;
-    ExpBlock(BlockLen, @Vector[BlockStart], @Result[BlockStart], Scratch);
-    Inc(BlockStart, EXP_LOG_BLOCK);
-  end;
+  Blocks := TBlocks.Create(System.Length(Vector));
+  while Blocks.Next do
+    ExpBlock(Blocks.Count, @Vector[Blocks.Start], @Result[Blocks.Start], Scratch);
 end;
 
 Procedure TVectorMath.Exp(const Vector, Result: TArray<Double>; out Sum: Double);
@@ -456,22 +475,15 @@ end;
 Procedure TVectorMath.Exp(const Vector, Result: TArray<Double>; out Sum: Double; var Scratch: TScratchBuffer);
 // Fused Exp + Sum: identical block loop to Exp(V,R,Scratch) with an extra
 // accumulation step over each block while it is still L1-resident.
-var
-  Len, BlockStart, BlockLen: Integer;
+var Blocks: TBlocks;
 begin
-  Len := Length(Vector);
   Sum := 0.0;
-  if Len = 0 then Exit;
   Scratch.EnsureSize(EXP_LOG_BLOCK);
-
-  BlockStart := 0;
-  while BlockStart < Len do
+  Blocks := TBlocks.Create(System.Length(Vector));
+  while Blocks.Next do
   begin
-    BlockLen := Len - BlockStart;
-    if BlockLen > EXP_LOG_BLOCK then BlockLen := EXP_LOG_BLOCK;
-    ExpBlock(BlockLen, @Vector[BlockStart], @Result[BlockStart], Scratch);
-    Sum := Sum + SumBlock(@Result[BlockStart], BlockLen);
-    Inc(BlockStart, EXP_LOG_BLOCK);
+    ExpBlock(Blocks.Count, @Vector[Blocks.Start], @Result[Blocks.Start], Scratch);
+    Sum := Sum + SumBlock(@Result[Blocks.Start], Blocks.Count);
   end;
 end;
 
@@ -492,51 +504,25 @@ Procedure TVectorMath.Log(const Vector, Result: TArray<Double>; var Scratch: TSc
 // |s| <= 0.172  ->  ~15 digit accuracy with 8 terms.
 //
 // LogCore dispatches to the subclass (fused SIMD or scalar two-pass).
-var
-  Len, BlockStart, BlockLen: Integer;
+var Blocks: TBlocks;
 begin
-  Len := Length(Vector);
-  if Len = 0 then Exit;
   Scratch.EnsureSize(EXP_LOG_BLOCK);
-
-  BlockStart := 0;
-  while BlockStart < Len do
-  begin
-    BlockLen := Len - BlockStart;
-    if BlockLen > EXP_LOG_BLOCK then BlockLen := EXP_LOG_BLOCK;
-    LogCore(BlockLen, @Vector[BlockStart], @Result[BlockStart],
+  Blocks := TBlocks.Create(System.Length(Vector));
+  while Blocks.Next do
+    LogCore(Blocks.Count, @Vector[Blocks.Start], @Result[Blocks.Start],
       @Scratch.FDouble[0][0], @Scratch.FDouble[3][0]);
-    Inc(BlockStart, EXP_LOG_BLOCK);
-  end;
 end;
 
 Procedure TVectorMath.LogCore(Count: Integer; X, Res, S, NLn2: PDouble);
 // Two-pass ln pipeline: argument reduction then Horner, each dispatching to
 // the subclass virtuals.  S and NLn2 are workspace of at least Count elements.
-var
-  FullQuads, TailStart, I, NI: Integer;
-  Bits: Int64;
-  M: Double;
+var FullQuads, I: Integer;
 begin
   FullQuads := Count shr 2;
-  TailStart := FullQuads shl 2;
-
-  // Vectorised argument-reduction for full groups of 4
+  // Vectorised argument-reduction for full groups of 4, then the scalar tail
   if FullQuads > 0 then
     LogReduce(FullQuads, X, S, NLn2);
-
-  // Scalar tail
-  for I := TailStart to Count - 1 do
-  begin
-    Bits := PInt64(@X[I])^;
-    NI   := Integer((Bits shr 52) and $7FF) - 1023;
-    M    := X[I];
-    PInt64(@M)^ := (Bits and $000FFFFFFFFFFFFF) or $3FF0000000000000;
-    if M >= SQRT2 then begin M := M * 0.5; Inc(NI); end;
-    S[I]    := (M - 1.0) / (M + 1.0);
-    NLn2[I] := NI * LN2;
-  end;
-
+  for I := FullQuads shl 2 to Count - 1 do S[I] := LogReduction(X[I], NLn2[I]);
   // Single-pass Horner: t=s^2, g(t) polynomial, result = s*g(t) + nln2.
   LogHorner(Count, S, NLn2, Res);
 end;
@@ -544,38 +530,20 @@ end;
 Procedure TVectorMath.ExpCore(Count: Integer; V, Res: PDouble;
   var Scratch: TScratchBuffer);
 // Three-pass exp pipeline: reduce -> Horner -> reconstruct, each dispatching to
-// the subclass virtuals.  Uses FDouble[1] as R, FDouble[2] as P, FInt64 as N.
+// the subclass virtuals, with a scalar tail after the full groups of 4.
+// Uses FDouble[1] as R, FDouble[2] as P, FInt64 as N.
 var
-  FullQuads, TailStart, I: Integer;
+  FullQuads, I: Integer;
   R, P: TArray<Double>;
-  N: TArray<Int64>;
-  TwoN: Double;
-  NI: Int64;
 begin
   FullQuads := Count shr 2;
-  TailStart := FullQuads shl 2;
   R := Scratch.FDouble[1];
   P := Scratch.FDouble[2];
-  N := Scratch.FInt64;
-
-  if FullQuads > 0 then
-    ExpReduce(FullQuads, V, @R[0], @N[0]);
-  for I := TailStart to Count - 1 do
-  begin
-    N[I] := System.Round(V[I] * LOG2E);
-    R[I] := (V[I] - N[I] * LN2HI) - N[I] * LN2LO;
-  end;
-
+  if FullQuads > 0 then ExpReduce(FullQuads, V, @R[0], @Scratch.FInt64[0]);
+  for I := FullQuads shl 2 to Count - 1 do R[I] := ExpReduction(V[I], Scratch.FInt64[I]);
   ExpHorner(Count, @R[0], @P[0]);
-
-  if FullQuads > 0 then
-    ExpRecon(FullQuads, @P[0], @N[0], Res);
-  for I := TailStart to Count - 1 do
-  begin
-    NI := N[I] + 1023;
-    PInt64(@TwoN)^ := NI shl 52;
-    Res[I] := P[I] * TwoN;
-  end;
+  if FullQuads > 0 then ExpRecon(FullQuads, @P[0], @Scratch.FInt64[0], Res);
+  for I := FullQuads shl 2 to Count - 1 do Res[I] := P[I] * PowerOfTwo(Scratch.FInt64[I]);
 end;
 
 Function TVectorMath.ExpInRange(Count: Integer; V: PDouble): Boolean;
@@ -629,9 +597,7 @@ begin
 end;
 
 Function TVectorMath.ExpMoments(const Scale: Double; const X, W: TArray<Double>; var Scratch: TScratchBuffer): TExpMoments;
-var
-  Blocks: TBlocks;
-  Moments: TExpMoments;
+var Blocks: TBlocks;
 begin
   Result := Default(TExpMoments);
   Scratch.EnsureSize(EXP_LOG_BLOCK);
@@ -640,9 +606,7 @@ begin
   begin
     MaskedScaleBlock(Scale, Blocks.Count, @X[Blocks.Start], @W[Blocks.Start], @Scratch.FDouble[0][0]);
     ExpBlock(Blocks.Count, @Scratch.FDouble[0][0], @Scratch.FDouble[3][0], Scratch);
-    Moments := ExpMomentsBlock(Blocks.Count, @X[Blocks.Start], @W[Blocks.Start], @Scratch.FDouble[3][0]);
-    Result.First := Result.First + Moments.First;
-    Result.Second := Result.Second + Moments.Second;
+    Result.Add(ExpMomentsBlock(Blocks.Count, @X[Blocks.Start], @W[Blocks.Start], @Scratch.FDouble[3][0]));
   end;
 end;
 

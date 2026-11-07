@@ -55,37 +55,42 @@ asm
   XGETBV                 // result lo32 -> EAX (returned), hi32 -> EDX (ignored)
 end;
 
-{$ENDIF}
-
-function GetCpuFeatures: TCpuFeatures;
-{$IF DEFINED(MSWINDOWS) AND DEFINED(CPUX64)}
 const
   EDX_SSE2    = 1 shl 26;
   ECX_OSXSAVE = 1 shl 27;  // OS has enabled XSAVE - required before XGETBV
   ECX_AVX     = 1 shl 28;
   EBX_AVX2    = 1 shl 5;
   XCR0_YMM   = $6;          // bits 1+2: OS saves XMM and YMM state
+
+function HasAVXSupport(const R: TCPUIDResult): Boolean;
+// The CPU has AVX and the OS saves the YMM state, which XGETBV reports once
+// the OS has enabled XSAVE
+begin
+  Result := ((R.ECX and ECX_OSXSAVE) <> 0) and ((R.ECX and ECX_AVX) <> 0) and
+            ((GetXCR0Low and XCR0_YMM) = XCR0_YMM);
+end;
+
+function HasAVX2Support: Boolean;
+var R: TCPUIDResult;
+begin
+  ExecuteCPUID(7, R);
+  Result := (R.EBX and EBX_AVX2) <> 0;
+end;
+
+{$ENDIF}
+
+function GetCpuFeatures: TCpuFeatures;
+{$IF DEFINED(MSWINDOWS) AND DEFINED(CPUX64)}
 var
-  R:    TCPUIDResult;
-  XCR0: Cardinal;
+  R: TCPUIDResult;
 {$ENDIF}
 begin
   Result := Default(TCpuFeatures);
   {$IF DEFINED(MSWINDOWS) AND DEFINED(CPUX64)}
   ExecuteCPUID(1, R);
   Result.HasSSE2 := (R.EDX and EDX_SSE2) <> 0;
-
-  if ((R.ECX and ECX_OSXSAVE) <> 0) and ((R.ECX and ECX_AVX) <> 0) then
-  begin
-    XCR0 := GetXCR0Low;
-    Result.HasAVX := (XCR0 and XCR0_YMM) = XCR0_YMM;
-  end;
-
-  if Result.HasAVX then
-  begin
-    ExecuteCPUID(7, R);
-    Result.HasAVX2 := (R.EBX and EBX_AVX2) <> 0;
-  end;
+  Result.HasAVX := HasAVXSupport(R);
+  Result.HasAVX2 := Result.HasAVX and HasAVX2Support;
   {$ENDIF}
 end;
 

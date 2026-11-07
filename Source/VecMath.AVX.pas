@@ -610,15 +610,11 @@ asm
 end;
 
 Function TVectorMathAVX.ExpMomentsBlock(Count: Integer; X, W, E: PDouble): TExpMoments;
-var
-  Tail: Integer;
-  Moments: TExpMoments;
+var Tail: Integer;
 begin
   Tail := Count and 3;
   AVXExpMomentsV(Count shr 2, X, W, E, @Result.First);
-  Moments := inherited ExpMomentsBlock(Tail, @X[Count - Tail], @W[Count - Tail], @E[Count - Tail]);
-  Result.First := Result.First + Moments.First;
-  Result.Second := Result.Second + Moments.Second;
+  Result.Add(inherited ExpMomentsBlock(Tail, @X[Count - Tail], @W[Count - Tail], @E[Count - Tail]));
 end;
 
 // In-place multiply: InOut[i] *= Src[i], 4 doubles per iteration.
@@ -650,33 +646,16 @@ begin
 end;
 
 // ---------------------------------------------------------------------------
-// Horner coefficients for exp(r) = 1 + r + r^2/2! + ... + r^12/12!
-// Degree 12: truncation error r^13/13! ~ 1.7e-16 at |r| = ln2/2 (~1 ulp).
-// Evaluation order (outermost to innermost):
+// Horner coefficients for exp(r) = 1 + r + r^2/2! + ... + r^12/12!, those of
+// TVectorMath.ExpPolynomial, evaluated outermost to innermost:
 //   p = r*c[0]+c[1]; p = r*p+c[2]; ... ; p = r*p+c[11]; p = r*p+c[11]
 // c[11] = 1.0 is reused for the final two steps (x^1 and x^0 terms).
+// Pre-broadcast: row k holds c[k] in all four lanes so a row can be used
+// directly as a 256-bit FMA memory operand (AVX2 has no embedded broadcast -
+// that arrived with AVX-512). Row k lives at byte offset k*32.
 // ---------------------------------------------------------------------------
 
 const
-  EXP_HORNER_C: array[0..11] of Double = (
-    1.0/479001600.0, // c0:  1/12!
-    1.0/39916800.0,  // c1:  1/11!
-    1.0/3628800.0,   // c2:  1/10!
-    1.0/362880.0,    // c3:  1/9!
-    1.0/40320.0,     // c4:  1/8!
-    1.0/5040.0,      // c5:  1/7!
-    1.0/720.0,       // c6:  1/6!
-    1.0/120.0,       // c7:  1/5!
-    1.0/24.0,        // c8:  1/4!
-    1.0/6.0,         // c9:  1/3!
-    0.5,             // c10: 1/2!
-    1.0              // c11: 1/1! and 1/0! (reused for both final steps)
-  );
-
-  // Same coefficients pre-broadcast: row k holds EXP_HORNER_C[k] in all four
-  // lanes so a row can be used directly as a 256-bit FMA memory operand
-  // (AVX2 has no embedded broadcast - that arrived with AVX-512).
-  // Row k lives at byte offset k*32.
   EXP_HORNER_C4: array[0..47] of Double = (
     1.0/479001600.0, 1.0/479001600.0, 1.0/479001600.0, 1.0/479001600.0, // c0
     1.0/39916800.0,  1.0/39916800.0,  1.0/39916800.0,  1.0/39916800.0,  // c1
@@ -905,53 +884,17 @@ Procedure TVectorMathAVX2.ExpCore(Count: Integer; V, Res: PDouble;
 // Scratch is unused here: the fused kernel keeps all intermediates in
 // registers and the scalar tail (0-3 elements) uses locals only.
 var
-  QuadCount, Tail, I: Integer;
-  Ri, Pi, TwoN: Double;
-  NI: Int64;
+  I: Integer;
+  N: Int64;
 begin
-  QuadCount := Count shr 2;
-  if QuadCount > 0 then
-    AVX2ExpCore4(QuadCount, V, Res, @EXP_HORNER_C4[0]);
-  Tail := Count and 3;
-  I    := Count - Tail;
-  while Tail > 0 do
+  if Count >= 4 then
+    AVX2ExpCore4(Count shr 2, V, Res, @EXP_HORNER_C4[0]);
+  for I := Count - (Count and 3) to Count - 1 do
   begin
-    NI := System.Round(V[I] * LOG2E);
-    Ri := (V[I] - NI * LN2HI) - NI * LN2LO;
-    Pi := Ri * EXP_HORNER_C[0] + EXP_HORNER_C[1];
-    Pi := Ri * Pi + EXP_HORNER_C[2];
-    Pi := Ri * Pi + EXP_HORNER_C[3];
-    Pi := Ri * Pi + EXP_HORNER_C[4];
-    Pi := Ri * Pi + EXP_HORNER_C[5];
-    Pi := Ri * Pi + EXP_HORNER_C[6];
-    Pi := Ri * Pi + EXP_HORNER_C[7];
-    Pi := Ri * Pi + EXP_HORNER_C[8];
-    Pi := Ri * Pi + EXP_HORNER_C[9];
-    Pi := Ri * Pi + EXP_HORNER_C[10];
-    Pi := Ri * Pi + EXP_HORNER_C[11];
-    Pi := Ri * Pi + EXP_HORNER_C[11];
-    PInt64(@TwoN)^ := (NI + 1023) shl 52;
-    Res[I] := Pi * TwoN;
-    Inc(I); Dec(Tail);
+    var R := ExpReduction(V[I], N);
+    Res[I] := ExpPolynomial(R) * PowerOfTwo(N);
   end;
 end;
-
-// ---------------------------------------------------------------------------
-// Horner coefficients for log polynomial g(t) = 2 + 2t/3 + ... + 2t^7/15
-// Evaluated as: p = t*c[0]+c[1]; p = t*p+c[2]; ... ; result = s*p + nln2
-// ---------------------------------------------------------------------------
-
-const
-  LOG_HORNER_C: array[0..7] of Double = (
-    2.0/15.0,  // c0: outermost coefficient
-    2.0/13.0,  // c1
-    2.0/11.0,  // c2
-    2.0/9.0,   // c3
-    2.0/7.0,   // c4
-    2.0/5.0,   // c5
-    2.0/3.0,   // c6
-    2.0        // c7: innermost
-  );
 
 // Fused AVX2+FMA ln pipeline: argument reduction, Horner polynomial and the
 // nln2 recombination in one loop, 4 vectors (16 doubles) per iteration.
@@ -1222,33 +1165,15 @@ Procedure TVectorMathAVX2.LogCore(Count: Integer; X, Res, S, NLn2: PDouble);
 // S and NLn2 are unused here: the fused kernel keeps all intermediates in
 // registers and the scalar tail (0-3 elements) uses locals only.
 var
-  QuadCount, Tail, I, NI: Integer;
-  Bits: Int64;
-  M, Si, Ti, Pi: Double;
+  I: Integer;
+  TailNLn2: Double;
 begin
-  QuadCount := Count shr 2;
-  if QuadCount > 0 then
-    AVX2LogCore4(QuadCount, X, Res);
-  Tail := Count and 3;
-  I    := Count - Tail;
-  while Tail > 0 do
+  if Count >= 4 then
+    AVX2LogCore4(Count shr 2, X, Res);
+  for I := Count - (Count and 3) to Count - 1 do
   begin
-    Bits := PInt64(@X[I])^;
-    NI   := Integer((Bits shr 52) and $7FF) - 1023;
-    M    := X[I];
-    PInt64(@M)^ := (Bits and $000FFFFFFFFFFFFF) or $3FF0000000000000;
-    if M >= SQRT2 then begin M := M * 0.5; Inc(NI); end;
-    Si := (M - 1.0) / (M + 1.0);
-    Ti := Si * Si;
-    Pi := Ti * LOG_HORNER_C[0] + LOG_HORNER_C[1];
-    Pi := Ti * Pi + LOG_HORNER_C[2];
-    Pi := Ti * Pi + LOG_HORNER_C[3];
-    Pi := Ti * Pi + LOG_HORNER_C[4];
-    Pi := Ti * Pi + LOG_HORNER_C[5];
-    Pi := Ti * Pi + LOG_HORNER_C[6];
-    Pi := Ti * Pi + LOG_HORNER_C[7];
-    Res[I] := Si * Pi + NI * LN2;
-    Inc(I); Dec(Tail);
+    var TailS := LogReduction(X[I], TailNLn2);
+    Res[I] := LogPolynomial(TailS) + TailNLn2;
   end;
 end;
 
