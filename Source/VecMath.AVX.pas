@@ -31,9 +31,9 @@ type
     Procedure Divide  (const Scalar: Double; const Vector, Result: TArray<Double>); overload; override;
     Procedure Divide  (const Left, Right, Result: TArray<Double>);                  overload; override;
     Procedure Sqrt    (const Vector, Result: TArray<Double>); override;
-    function  Sum            (const Vector: TArray<Double>): Double; override;
-    function  SumBlock       (Data: PDouble; Count: Integer): Double; override;
-    function  WeightedSumBlock(Data, Weights: PDouble; Count: Integer): Double; override;
+    Function  Sum            (const Vector: TArray<Double>): Double; override;
+    Function  SumBlock       (Data: PDouble; Count: Integer): Double; override;
+    Function  WeightedSumBlock(Data, Weights: PDouble; Count: Integer): Double; override;
     Procedure MultiplyBlock  (Count: Integer; Src, InOut: PDouble); override;
   {$ENDIF}
   end;
@@ -46,10 +46,10 @@ type
     // Fused exp/ln pipelines: reduce -> Horner (-> reconstruct) in a single asm
     // loop with all intermediates register-resident.
     Procedure ExpCore(Count: Integer; V, Res: PDouble;
-      var Scratch: TScratchBuffer); override;
+                      var Scratch: TScratchBuffer); override;
     Procedure LogCore(Count: Integer; X, Res, S, NLn2: PDouble); override;
   public
-    function  WeightedSumBlock(Data, Weights: PDouble; Count: Integer): Double; override;
+    Function  WeightedSumBlock(Data, Weights: PDouble; Count: Integer): Double; override;
     Procedure ScaleAddBlock(Scale: Double; Count: Integer; Src, Dest: PDouble); override;
   {$ENDIF}
   end;
@@ -71,409 +71,6 @@ implementation
 // Scalar broadcast (AVX without AVX2):
 //   VUNPCKLPD XMM0, XMM0, XMM0   -> XMM0 = [s, s]
 //   VINSERTF128 YMM0, YMM0, XMM0, 1  -> YMM0 = [s, s, s, s]
-
-// ---- vector op vector -------------------------------------------------------
-
-Procedure AVXVAddV(QuadCount: Integer; L, R, Res: PDouble);
-// RCX=QuadCount  RDX=L  R8=R  R9=Res
-asm
-  TEST  ECX, ECX
-  JLE   @done
-@loop:
-  VMOVUPD   YMM0, [RDX]
-  VMOVUPD   YMM1, [R8]
-  VADDPD    YMM0, YMM0, YMM1
-  VMOVUPD   [R9], YMM0
-  ADD       RDX, 32
-  ADD       R8,  32
-  ADD       R9,  32
-  DEC       ECX
-  JNZ       @loop
-@done:
-  VZEROUPPER
-end;
-
-Procedure AVXVSubV(QuadCount: Integer; L, R, Res: PDouble);
-asm
-  TEST  ECX, ECX
-  JLE   @done
-@loop:
-  VMOVUPD   YMM0, [RDX]
-  VMOVUPD   YMM1, [R8]
-  VSUBPD    YMM0, YMM0, YMM1
-  VMOVUPD   [R9], YMM0
-  ADD       RDX, 32
-  ADD       R8,  32
-  ADD       R9,  32
-  DEC       ECX
-  JNZ       @loop
-@done:
-  VZEROUPPER
-end;
-
-Procedure AVXVMulV(QuadCount: Integer; L, R, Res: PDouble);
-asm
-  TEST  ECX, ECX
-  JLE   @done
-@loop:
-  VMOVUPD   YMM0, [RDX]
-  VMOVUPD   YMM1, [R8]
-  VMULPD    YMM0, YMM0, YMM1
-  VMOVUPD   [R9], YMM0
-  ADD       RDX, 32
-  ADD       R8,  32
-  ADD       R9,  32
-  DEC       ECX
-  JNZ       @loop
-@done:
-  VZEROUPPER
-end;
-
-Procedure AVXVDivV(QuadCount: Integer; L, R, Res: PDouble);
-asm
-  TEST  ECX, ECX
-  JLE   @done
-@loop:
-  VMOVUPD   YMM0, [RDX]
-  VMOVUPD   YMM1, [R8]
-  VDIVPD    YMM0, YMM0, YMM1
-  VMOVUPD   [R9], YMM0
-  ADD       RDX, 32
-  ADD       R8,  32
-  ADD       R9,  32
-  DEC       ECX
-  JNZ       @loop
-@done:
-  VZEROUPPER
-end;
-
-Procedure AVXVSqrt(QuadCount: Integer; V, Res: PDouble);
-// RCX=QuadCount  RDX=V  R8=Res
-asm
-  TEST  ECX, ECX
-  JLE   @done
-@loop:
-  VMOVUPD   YMM0, [RDX]
-  VSQRTPD   YMM0, YMM0
-  VMOVUPD   [R8], YMM0
-  ADD       RDX, 32
-  ADD       R8,  32
-  DEC       ECX
-  JNZ       @loop
-@done:
-  VZEROUPPER
-end;
-
-// ---- scalar op vector -------------------------------------------------------
-// Scalar in XMM0 (position 0), QuadCount in RDX, V in R8, Res in R9.
-
-Procedure AVXSAddV(Scalar: Double; QuadCount: Integer; V, Res: PDouble);
-// XMM0=Scalar  RDX=QuadCount  R8=V  R9=Res
-asm
-  TEST        EDX, EDX
-  JLE         @done
-  VUNPCKLPD   XMM0, XMM0, XMM0     // XMM0 = [s, s]
-  VINSERTF128 YMM0, YMM0, XMM0, 1  // YMM0 = [s, s, s, s]
-@loop:
-  VMOVUPD     YMM1, [R8]
-  VADDPD      YMM1, YMM1, YMM0
-  VMOVUPD     [R9], YMM1
-  ADD         R8, 32
-  ADD         R9, 32
-  DEC         EDX
-  JNZ         @loop
-@done:
-  VZEROUPPER
-end;
-
-Procedure AVXSSubV(Scalar: Double; QuadCount: Integer; V, Res: PDouble);
-asm
-  TEST        EDX, EDX
-  JLE         @done
-  VUNPCKLPD   XMM0, XMM0, XMM0
-  VINSERTF128 YMM0, YMM0, XMM0, 1
-@loop:
-  VMOVUPD     YMM1, [R8]
-  VSUBPD      YMM1, YMM1, YMM0
-  VMOVUPD     [R9], YMM1
-  ADD         R8, 32
-  ADD         R9, 32
-  DEC         EDX
-  JNZ         @loop
-@done:
-  VZEROUPPER
-end;
-
-Procedure AVXSMulV(Scalar: Double; QuadCount: Integer; V, Res: PDouble);
-asm
-  TEST        EDX, EDX
-  JLE         @done
-  VUNPCKLPD   XMM0, XMM0, XMM0
-  VINSERTF128 YMM0, YMM0, XMM0, 1
-@loop:
-  VMOVUPD     YMM1, [R8]
-  VMULPD      YMM1, YMM1, YMM0
-  VMOVUPD     [R9], YMM1
-  ADD         R8, 32
-  ADD         R9, 32
-  DEC         EDX
-  JNZ         @loop
-@done:
-  VZEROUPPER
-end;
-
-// ---- horizontal sum ---------------------------------------------------------
-
-function AVXSumV(QuadCount: Integer; V: PDouble): Double;
-// RCX=QuadCount  RDX=V  -> result in XMM0
-//
-// Four accumulators (YMM0-YMM3) break the VADDPD latency chain: with a
-// single accumulator each add must wait ~4 cycles for the previous one,
-// capping throughput at 1 double/cycle; four independent chains keep the
-// add ports busy and let L1 loads run at full speed.
-asm
-  VXORPD       YMM0, YMM0, YMM0
-  VXORPD       YMM1, YMM1, YMM1
-  VXORPD       YMM2, YMM2, YMM2
-  VXORPD       YMM3, YMM3, YMM3
-  // 4-quad groups (16 doubles per iteration)
-  MOV          EAX, ECX
-  SHR          EAX, 2
-  JZ           @rest
-@loop4:
-  VADDPD       YMM0, YMM0, [RDX]
-  VADDPD       YMM1, YMM1, [RDX+32]
-  VADDPD       YMM2, YMM2, [RDX+64]
-  VADDPD       YMM3, YMM3, [RDX+96]
-  ADD          RDX, 128
-  DEC          EAX
-  JNZ          @loop4
-@rest:
-  // Remaining 0-3 quads
-  AND          ECX, 3
-  JZ           @reduce
-@loop1:
-  VADDPD       YMM0, YMM0, [RDX]
-  ADD          RDX, 32
-  DEC          ECX
-  JNZ          @loop1
-@reduce:
-  VADDPD       YMM0, YMM0, YMM1
-  VADDPD       YMM2, YMM2, YMM3
-  VADDPD       YMM0, YMM0, YMM2
-  VEXTRACTF128 XMM1, YMM0, 1      // XMM1 = [e2, e3]
-  VADDPD       XMM0, XMM0, XMM1  // XMM0 = [e0+e2, e1+e3]
-  VUNPCKHPD    XMM1, XMM0, XMM0  // XMM1[0] = e1+e3
-  VADDSD       XMM0, XMM0, XMM1  // XMM0[0] = e0+e1+e2+e3
-  VZEROUPPER
-end;
-
-// ---- method wrappers --------------------------------------------------------
-
-Procedure TVectorMathAVX.Add(const Scalar: Double; const Vector, Result: TArray<Double>);
-var Len, Tail: Integer;
-begin
-  Len  := Length(Vector);
-  Tail := Len and 3;
-  if Len >= 4 then AVXSAddV(Scalar, Len shr 2, @Vector[0], @Result[0]);
-  while Tail > 0 do
-  begin
-    Result[Len - Tail] := Vector[Len - Tail] + Scalar;
-    Dec(Tail);
-  end;
-end;
-
-Procedure TVectorMathAVX.Add(const Left, Right, Result: TArray<Double>);
-var Len, Tail: Integer;
-begin
-  Len  := Length(Left);
-  Tail := Len and 3;
-  if Len >= 4 then AVXVAddV(Len shr 2, @Left[0], @Right[0], @Result[0]);
-  while Tail > 0 do
-  begin
-    Result[Len - Tail] := Left[Len - Tail] + Right[Len - Tail];
-    Dec(Tail);
-  end;
-end;
-
-Procedure TVectorMathAVX.Subtract(const Scalar: Double; const Vector, Result: TArray<Double>);
-var Len, Tail: Integer;
-begin
-  Len  := Length(Vector);
-  Tail := Len and 3;
-  if Len >= 4 then AVXSSubV(Scalar, Len shr 2, @Vector[0], @Result[0]);
-  while Tail > 0 do
-  begin
-    Result[Len - Tail] := Vector[Len - Tail] - Scalar;
-    Dec(Tail);
-  end;
-end;
-
-Procedure TVectorMathAVX.Subtract(const Left, Right, Result: TArray<Double>);
-var Len, Tail: Integer;
-begin
-  Len  := Length(Left);
-  Tail := Len and 3;
-  if Len >= 4 then AVXVSubV(Len shr 2, @Left[0], @Right[0], @Result[0]);
-  while Tail > 0 do
-  begin
-    Result[Len - Tail] := Left[Len - Tail] - Right[Len - Tail];
-    Dec(Tail);
-  end;
-end;
-
-Procedure TVectorMathAVX.Multiply(const Scalar: Double; const Vector, Result: TArray<Double>);
-var Len, Tail: Integer;
-begin
-  Len  := Length(Vector);
-  Tail := Len and 3;
-  if Len >= 4 then AVXSMulV(Scalar, Len shr 2, @Vector[0], @Result[0]);
-  while Tail > 0 do
-  begin
-    Result[Len - Tail] := Vector[Len - Tail] * Scalar;
-    Dec(Tail);
-  end;
-end;
-
-Procedure TVectorMathAVX.Multiply(const Left, Right, Result: TArray<Double>);
-var Len, Tail: Integer;
-begin
-  Len  := Length(Left);
-  Tail := Len and 3;
-  if Len >= 4 then AVXVMulV(Len shr 2, @Left[0], @Right[0], @Result[0]);
-  while Tail > 0 do
-  begin
-    Result[Len - Tail] := Left[Len - Tail] * Right[Len - Tail];
-    Dec(Tail);
-  end;
-end;
-
-Procedure TVectorMathAVX.Divide(const Scalar: Double; const Vector, Result: TArray<Double>);
-var Len, Tail: Integer; Recip: Double;
-begin
-  Len  := Length(Vector);
-  Tail := Len and 3;
-  Recip := 1.0 / Scalar;
-  if Len >= 4 then AVXSMulV(Recip, Len shr 2, @Vector[0], @Result[0]);
-  // Tail multiplies by the reciprocal like the SIMD body and the scalar base
-  // class, so all elements (and all engines) round identically.
-  while Tail > 0 do
-  begin
-    Result[Len - Tail] := Vector[Len - Tail] * Recip;
-    Dec(Tail);
-  end;
-end;
-
-Procedure TVectorMathAVX.Divide(const Left, Right, Result: TArray<Double>);
-var Len, Tail: Integer;
-begin
-  Len  := Length(Left);
-  Tail := Len and 3;
-  if Len >= 4 then AVXVDivV(Len shr 2, @Left[0], @Right[0], @Result[0]);
-  while Tail > 0 do
-  begin
-    Result[Len - Tail] := Left[Len - Tail] / Right[Len - Tail];
-    Dec(Tail);
-  end;
-end;
-
-Procedure TVectorMathAVX.Sqrt(const Vector, Result: TArray<Double>);
-var Len, Tail: Integer;
-begin
-  Len  := Length(Vector);
-  Tail := Len and 3;
-  if Len >= 4 then AVXVSqrt(Len shr 2, @Vector[0], @Result[0]);
-  while Tail > 0 do
-  begin
-    Result[Len - Tail] := System.Sqrt(Vector[Len - Tail]);
-    Dec(Tail);
-  end;
-end;
-
-function TVectorMathAVX.Sum(const Vector: TArray<Double>): Double;
-var Len, Tail, I: Integer;
-begin
-  Len  := Length(Vector);
-  Tail := Len and 3;
-  if Len >= 4 then
-    Result := AVXSumV(Len shr 2, @Vector[0])
-  else
-    Result := 0.0;
-  for I := Len - Tail to Len - 1 do
-    Result := Result + Vector[I];
-end;
-
-function TVectorMathAVX.SumBlock(Data: PDouble; Count: Integer): Double;
-var Tail, I: Integer;
-begin
-  Tail := Count and 3;
-  if Count >= 4 then Result := AVXSumV(Count shr 2, Data)
-  else Result := 0.0;
-  for I := Count - Tail to Count - 1 do Result := Result + Data[I];
-end;
-
-// Weighted sum: Sum Data[i] * Weights[i].
-// Four accumulators break the VADDPD latency chain (see AVXSumV).
-// Win64: RCX=QuadCount  RDX=Data  R8=Weights  -> result in XMM0
-function AVXWeightedSumV(QuadCount: Integer; Data, Weights: PDouble): Double;
-asm
-  VXORPD    YMM0, YMM0, YMM0
-  VXORPD    YMM1, YMM1, YMM1
-  VXORPD    YMM2, YMM2, YMM2
-  VXORPD    YMM3, YMM3, YMM3
-  // 4-quad groups (16 doubles per iteration)
-  MOV       EAX, ECX
-  SHR       EAX, 2
-  JZ        @rest
-@loop4:
-  VMOVUPD   YMM4, [RDX]
-  VMULPD    YMM4, YMM4, [R8]
-  VADDPD    YMM0, YMM0, YMM4
-  VMOVUPD   YMM5, [RDX+32]
-  VMULPD    YMM5, YMM5, [R8+32]
-  VADDPD    YMM1, YMM1, YMM5
-  VMOVUPD   YMM4, [RDX+64]
-  VMULPD    YMM4, YMM4, [R8+64]
-  VADDPD    YMM2, YMM2, YMM4
-  VMOVUPD   YMM5, [RDX+96]
-  VMULPD    YMM5, YMM5, [R8+96]
-  VADDPD    YMM3, YMM3, YMM5
-  ADD       RDX, 128
-  ADD       R8,  128
-  DEC       EAX
-  JNZ       @loop4
-@rest:
-  // Remaining 0-3 quads
-  AND       ECX, 3
-  JZ        @reduce
-@loop1:
-  VMOVUPD   YMM4, [RDX]
-  VMULPD    YMM4, YMM4, [R8]
-  VADDPD    YMM0, YMM0, YMM4
-  ADD       RDX, 32
-  ADD       R8,  32
-  DEC       ECX
-  JNZ       @loop1
-@reduce:
-  VADDPD    YMM0, YMM0, YMM1
-  VADDPD    YMM2, YMM2, YMM3
-  VADDPD    YMM0, YMM0, YMM2
-  VEXTRACTF128 XMM1, YMM0, 1
-  VADDPD    XMM0, XMM0, XMM1
-  VUNPCKHPD XMM1, XMM0, XMM0
-  VADDSD    XMM0, XMM0, XMM1
-  VZEROUPPER
-end;
-
-function TVectorMathAVX.WeightedSumBlock(Data, Weights: PDouble; Count: Integer): Double;
-var Tail, I: Integer;
-begin
-  Tail := Count and 3;
-  if Count >= 4 then Result := AVXWeightedSumV(Count shr 2, Data, Weights)
-  else Result := 0.0;
-  for I := Count - Tail to Count - 1 do
-    Result := Result + Data[I] * Weights[I];
-end;
 
 // Whether |v| <= 708 (TVectorMath.EXP_LIMIT) for QuadCount groups of 4 doubles;
 // a NaN fails. A lane fails when |v| is not <= 708 (NLE_UQ, true for a NaN),
@@ -617,6 +214,402 @@ begin
   Result.Add(inherited ExpMomentsBlock(Tail, @X[Count - Tail], @W[Count - Tail], @E[Count - Tail]));
 end;
 
+Procedure AVXVAddV(QuadCount: Integer; L, R, Res: PDouble);
+// RCX=QuadCount  RDX=L  R8=R  R9=Res
+asm
+  TEST  ECX, ECX
+  JLE   @done
+@loop:
+  VMOVUPD   YMM0, [RDX]
+  VMOVUPD   YMM1, [R8]
+  VADDPD    YMM0, YMM0, YMM1
+  VMOVUPD   [R9], YMM0
+  ADD       RDX, 32
+  ADD       R8,  32
+  ADD       R9,  32
+  DEC       ECX
+  JNZ       @loop
+@done:
+  VZEROUPPER
+end;
+
+Procedure AVXVSubV(QuadCount: Integer; L, R, Res: PDouble);
+asm
+  TEST  ECX, ECX
+  JLE   @done
+@loop:
+  VMOVUPD   YMM0, [RDX]
+  VMOVUPD   YMM1, [R8]
+  VSUBPD    YMM0, YMM0, YMM1
+  VMOVUPD   [R9], YMM0
+  ADD       RDX, 32
+  ADD       R8,  32
+  ADD       R9,  32
+  DEC       ECX
+  JNZ       @loop
+@done:
+  VZEROUPPER
+end;
+
+Procedure AVXVMulV(QuadCount: Integer; L, R, Res: PDouble);
+asm
+  TEST  ECX, ECX
+  JLE   @done
+@loop:
+  VMOVUPD   YMM0, [RDX]
+  VMOVUPD   YMM1, [R8]
+  VMULPD    YMM0, YMM0, YMM1
+  VMOVUPD   [R9], YMM0
+  ADD       RDX, 32
+  ADD       R8,  32
+  ADD       R9,  32
+  DEC       ECX
+  JNZ       @loop
+@done:
+  VZEROUPPER
+end;
+
+Procedure AVXVDivV(QuadCount: Integer; L, R, Res: PDouble);
+asm
+  TEST  ECX, ECX
+  JLE   @done
+@loop:
+  VMOVUPD   YMM0, [RDX]
+  VMOVUPD   YMM1, [R8]
+  VDIVPD    YMM0, YMM0, YMM1
+  VMOVUPD   [R9], YMM0
+  ADD       RDX, 32
+  ADD       R8,  32
+  ADD       R9,  32
+  DEC       ECX
+  JNZ       @loop
+@done:
+  VZEROUPPER
+end;
+
+Procedure AVXVSqrt(QuadCount: Integer; V, Res: PDouble);
+// RCX=QuadCount  RDX=V  R8=Res
+asm
+  TEST  ECX, ECX
+  JLE   @done
+@loop:
+  VMOVUPD   YMM0, [RDX]
+  VSQRTPD   YMM0, YMM0
+  VMOVUPD   [R8], YMM0
+  ADD       RDX, 32
+  ADD       R8,  32
+  DEC       ECX
+  JNZ       @loop
+@done:
+  VZEROUPPER
+end;
+
+// Scalar in XMM0 (position 0), QuadCount in RDX, V in R8, Res in R9.
+
+Procedure AVXSAddV(Scalar: Double; QuadCount: Integer; V, Res: PDouble);
+// XMM0=Scalar  RDX=QuadCount  R8=V  R9=Res
+asm
+  TEST        EDX, EDX
+  JLE         @done
+  VUNPCKLPD   XMM0, XMM0, XMM0     // XMM0 = [s, s]
+  VINSERTF128 YMM0, YMM0, XMM0, 1  // YMM0 = [s, s, s, s]
+@loop:
+  VMOVUPD     YMM1, [R8]
+  VADDPD      YMM1, YMM1, YMM0
+  VMOVUPD     [R9], YMM1
+  ADD         R8, 32
+  ADD         R9, 32
+  DEC         EDX
+  JNZ         @loop
+@done:
+  VZEROUPPER
+end;
+
+Procedure AVXSSubV(Scalar: Double; QuadCount: Integer; V, Res: PDouble);
+asm
+  TEST        EDX, EDX
+  JLE         @done
+  VUNPCKLPD   XMM0, XMM0, XMM0
+  VINSERTF128 YMM0, YMM0, XMM0, 1
+@loop:
+  VMOVUPD     YMM1, [R8]
+  VSUBPD      YMM1, YMM1, YMM0
+  VMOVUPD     [R9], YMM1
+  ADD         R8, 32
+  ADD         R9, 32
+  DEC         EDX
+  JNZ         @loop
+@done:
+  VZEROUPPER
+end;
+
+Procedure AVXSMulV(Scalar: Double; QuadCount: Integer; V, Res: PDouble);
+asm
+  TEST        EDX, EDX
+  JLE         @done
+  VUNPCKLPD   XMM0, XMM0, XMM0
+  VINSERTF128 YMM0, YMM0, XMM0, 1
+@loop:
+  VMOVUPD     YMM1, [R8]
+  VMULPD      YMM1, YMM1, YMM0
+  VMOVUPD     [R9], YMM1
+  ADD         R8, 32
+  ADD         R9, 32
+  DEC         EDX
+  JNZ         @loop
+@done:
+  VZEROUPPER
+end;
+
+Function AVXSumV(QuadCount: Integer; V: PDouble): Double;
+// RCX=QuadCount  RDX=V  -> result in XMM0
+//
+// Four accumulators (YMM0-YMM3) break the VADDPD latency chain: with a
+// single accumulator each add must wait ~4 cycles for the previous one,
+// capping throughput at 1 double/cycle; four independent chains keep the
+// add ports busy and let L1 loads run at full speed.
+asm
+  VXORPD       YMM0, YMM0, YMM0
+  VXORPD       YMM1, YMM1, YMM1
+  VXORPD       YMM2, YMM2, YMM2
+  VXORPD       YMM3, YMM3, YMM3
+  // 4-quad groups (16 doubles per iteration)
+  MOV          EAX, ECX
+  SHR          EAX, 2
+  JZ           @rest
+@loop4:
+  VADDPD       YMM0, YMM0, [RDX]
+  VADDPD       YMM1, YMM1, [RDX+32]
+  VADDPD       YMM2, YMM2, [RDX+64]
+  VADDPD       YMM3, YMM3, [RDX+96]
+  ADD          RDX, 128
+  DEC          EAX
+  JNZ          @loop4
+@rest:
+  // Remaining 0-3 quads
+  AND          ECX, 3
+  JZ           @reduce
+@loop1:
+  VADDPD       YMM0, YMM0, [RDX]
+  ADD          RDX, 32
+  DEC          ECX
+  JNZ          @loop1
+@reduce:
+  VADDPD       YMM0, YMM0, YMM1
+  VADDPD       YMM2, YMM2, YMM3
+  VADDPD       YMM0, YMM0, YMM2
+  VEXTRACTF128 XMM1, YMM0, 1      // XMM1 = [e2, e3]
+  VADDPD       XMM0, XMM0, XMM1  // XMM0 = [e0+e2, e1+e3]
+  VUNPCKHPD    XMM1, XMM0, XMM0  // XMM1[0] = e1+e3
+  VADDSD       XMM0, XMM0, XMM1  // XMM0[0] = e0+e1+e2+e3
+  VZEROUPPER
+end;
+
+Procedure TVectorMathAVX.Add(const Scalar: Double; const Vector, Result: TArray<Double>);
+var Len, Tail: Integer;
+begin
+  Len  := Length(Vector);
+  Tail := Len and 3;
+  if Len >= 4 then AVXSAddV(Scalar, Len shr 2, @Vector[0], @Result[0]);
+  while Tail > 0 do
+  begin
+    Result[Len - Tail] := Vector[Len - Tail] + Scalar;
+    Dec(Tail);
+  end;
+end;
+
+Procedure TVectorMathAVX.Add(const Left, Right, Result: TArray<Double>);
+var Len, Tail: Integer;
+begin
+  Len  := Length(Left);
+  Tail := Len and 3;
+  if Len >= 4 then AVXVAddV(Len shr 2, @Left[0], @Right[0], @Result[0]);
+  while Tail > 0 do
+  begin
+    Result[Len - Tail] := Left[Len - Tail] + Right[Len - Tail];
+    Dec(Tail);
+  end;
+end;
+
+Procedure TVectorMathAVX.Subtract(const Scalar: Double; const Vector, Result: TArray<Double>);
+var Len, Tail: Integer;
+begin
+  Len  := Length(Vector);
+  Tail := Len and 3;
+  if Len >= 4 then AVXSSubV(Scalar, Len shr 2, @Vector[0], @Result[0]);
+  while Tail > 0 do
+  begin
+    Result[Len - Tail] := Vector[Len - Tail] - Scalar;
+    Dec(Tail);
+  end;
+end;
+
+Procedure TVectorMathAVX.Subtract(const Left, Right, Result: TArray<Double>);
+var Len, Tail: Integer;
+begin
+  Len  := Length(Left);
+  Tail := Len and 3;
+  if Len >= 4 then AVXVSubV(Len shr 2, @Left[0], @Right[0], @Result[0]);
+  while Tail > 0 do
+  begin
+    Result[Len - Tail] := Left[Len - Tail] - Right[Len - Tail];
+    Dec(Tail);
+  end;
+end;
+
+Procedure TVectorMathAVX.Multiply(const Scalar: Double; const Vector, Result: TArray<Double>);
+var Len, Tail: Integer;
+begin
+  Len  := Length(Vector);
+  Tail := Len and 3;
+  if Len >= 4 then AVXSMulV(Scalar, Len shr 2, @Vector[0], @Result[0]);
+  while Tail > 0 do
+  begin
+    Result[Len - Tail] := Vector[Len - Tail] * Scalar;
+    Dec(Tail);
+  end;
+end;
+
+Procedure TVectorMathAVX.Multiply(const Left, Right, Result: TArray<Double>);
+var Len, Tail: Integer;
+begin
+  Len  := Length(Left);
+  Tail := Len and 3;
+  if Len >= 4 then AVXVMulV(Len shr 2, @Left[0], @Right[0], @Result[0]);
+  while Tail > 0 do
+  begin
+    Result[Len - Tail] := Left[Len - Tail] * Right[Len - Tail];
+    Dec(Tail);
+  end;
+end;
+
+Procedure TVectorMathAVX.Divide(const Scalar: Double; const Vector, Result: TArray<Double>);
+var Len, Tail: Integer; Recip: Double;
+begin
+  Len  := Length(Vector);
+  Tail := Len and 3;
+  Recip := 1.0 / Scalar;
+  if Len >= 4 then AVXSMulV(Recip, Len shr 2, @Vector[0], @Result[0]);
+  // Tail multiplies by the reciprocal like the SIMD body and the scalar base
+  // class, so all elements (and all engines) round identically.
+  while Tail > 0 do
+  begin
+    Result[Len - Tail] := Vector[Len - Tail] * Recip;
+    Dec(Tail);
+  end;
+end;
+
+Procedure TVectorMathAVX.Divide(const Left, Right, Result: TArray<Double>);
+var Len, Tail: Integer;
+begin
+  Len  := Length(Left);
+  Tail := Len and 3;
+  if Len >= 4 then AVXVDivV(Len shr 2, @Left[0], @Right[0], @Result[0]);
+  while Tail > 0 do
+  begin
+    Result[Len - Tail] := Left[Len - Tail] / Right[Len - Tail];
+    Dec(Tail);
+  end;
+end;
+
+Procedure TVectorMathAVX.Sqrt(const Vector, Result: TArray<Double>);
+var Len, Tail: Integer;
+begin
+  Len  := Length(Vector);
+  Tail := Len and 3;
+  if Len >= 4 then AVXVSqrt(Len shr 2, @Vector[0], @Result[0]);
+  while Tail > 0 do
+  begin
+    Result[Len - Tail] := System.Sqrt(Vector[Len - Tail]);
+    Dec(Tail);
+  end;
+end;
+
+Function TVectorMathAVX.Sum(const Vector: TArray<Double>): Double;
+var Len, Tail, I: Integer;
+begin
+  Len  := Length(Vector);
+  Tail := Len and 3;
+  if Len >= 4 then
+    Result := AVXSumV(Len shr 2, @Vector[0])
+  else
+    Result := 0.0;
+  for I := Len - Tail to Len - 1 do
+    Result := Result + Vector[I];
+end;
+
+Function TVectorMathAVX.SumBlock(Data: PDouble; Count: Integer): Double;
+var Tail, I: Integer;
+begin
+  Tail := Count and 3;
+  if Count >= 4 then Result := AVXSumV(Count shr 2, Data)
+  else Result := 0.0;
+  for I := Count - Tail to Count - 1 do Result := Result + Data[I];
+end;
+
+// Weighted sum: Sum Data[i] * Weights[i].
+// Four accumulators break the VADDPD latency chain (see AVXSumV).
+// Win64: RCX=QuadCount  RDX=Data  R8=Weights  -> result in XMM0
+Function AVXWeightedSumV(QuadCount: Integer; Data, Weights: PDouble): Double;
+asm
+  VXORPD    YMM0, YMM0, YMM0
+  VXORPD    YMM1, YMM1, YMM1
+  VXORPD    YMM2, YMM2, YMM2
+  VXORPD    YMM3, YMM3, YMM3
+  // 4-quad groups (16 doubles per iteration)
+  MOV       EAX, ECX
+  SHR       EAX, 2
+  JZ        @rest
+@loop4:
+  VMOVUPD   YMM4, [RDX]
+  VMULPD    YMM4, YMM4, [R8]
+  VADDPD    YMM0, YMM0, YMM4
+  VMOVUPD   YMM5, [RDX+32]
+  VMULPD    YMM5, YMM5, [R8+32]
+  VADDPD    YMM1, YMM1, YMM5
+  VMOVUPD   YMM4, [RDX+64]
+  VMULPD    YMM4, YMM4, [R8+64]
+  VADDPD    YMM2, YMM2, YMM4
+  VMOVUPD   YMM5, [RDX+96]
+  VMULPD    YMM5, YMM5, [R8+96]
+  VADDPD    YMM3, YMM3, YMM5
+  ADD       RDX, 128
+  ADD       R8,  128
+  DEC       EAX
+  JNZ       @loop4
+@rest:
+  // Remaining 0-3 quads
+  AND       ECX, 3
+  JZ        @reduce
+@loop1:
+  VMOVUPD   YMM4, [RDX]
+  VMULPD    YMM4, YMM4, [R8]
+  VADDPD    YMM0, YMM0, YMM4
+  ADD       RDX, 32
+  ADD       R8,  32
+  DEC       ECX
+  JNZ       @loop1
+@reduce:
+  VADDPD    YMM0, YMM0, YMM1
+  VADDPD    YMM2, YMM2, YMM3
+  VADDPD    YMM0, YMM0, YMM2
+  VEXTRACTF128 XMM1, YMM0, 1
+  VADDPD    XMM0, XMM0, XMM1
+  VUNPCKHPD XMM1, XMM0, XMM0
+  VADDSD    XMM0, XMM0, XMM1
+  VZEROUPPER
+end;
+
+Function TVectorMathAVX.WeightedSumBlock(Data, Weights: PDouble; Count: Integer): Double;
+var Tail, I: Integer;
+begin
+  Tail := Count and 3;
+  if Count >= 4 then Result := AVXWeightedSumV(Count shr 2, Data, Weights)
+  else Result := 0.0;
+  for I := Count - Tail to Count - 1 do
+    Result := Result + Data[I] * Weights[I];
+end;
+
 // In-place multiply: InOut[i] *= Src[i], 4 doubles per iteration.
 // Streaming (no loop-carried dependency), so one accumulator-free pass suffices.
 // Win64: RCX=QuadCount  RDX=Src  R8=InOut
@@ -645,7 +638,8 @@ begin
     InOut[I] := InOut[I] * Src[I];
 end;
 
-// ---------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////
+
 // Horner coefficients for exp(r) = 1 + r + r^2/2! + ... + r^12/12!, those of
 // TVectorMath.ExpPolynomial, evaluated outermost to innermost:
 //   p = r*c[0]+c[1]; p = r*p+c[2]; ... ; p = r*p+c[11]; p = r*p+c[11]
@@ -653,7 +647,6 @@ end;
 // Pre-broadcast: row k holds c[k] in all four lanes so a row can be used
 // directly as a 256-bit FMA memory operand (AVX2 has no embedded broadcast -
 // that arrived with AVX-512). Row k lives at byte offset k*32.
-// ---------------------------------------------------------------------------
 
 const
   EXP_HORNER_C4: array[0..47] of Double = (
@@ -875,12 +868,8 @@ asm
   VZEROUPPER
 end;
 
-// ---------------------------------------------------------------------------
-// TVectorMathAVX2 - reduce/recon hooks delegating to the AVX2 asm helpers
-// ---------------------------------------------------------------------------
-
 Procedure TVectorMathAVX2.ExpCore(Count: Integer; V, Res: PDouble;
-  var Scratch: TScratchBuffer);
+                                  var Scratch: TScratchBuffer);
 // Scratch is unused here: the fused kernel keeps all intermediates in
 // registers and the scalar tail (0-3 elements) uses locals only.
 var
@@ -991,7 +980,7 @@ asm
   SHR   EAX, 2
   JZ    @rest
 @loop4:
-  // ---- Phase 1: reduce vector 0 -> s in YMM0, nln2 in YMM4 (temps YMM12-15)
+  // Phase 1: reduce vector 0 -> s in YMM0, nln2 in YMM4 (temps YMM12-15)
   VMOVUPD      YMM12, [RDX]
   VPSRLQ       YMM13, YMM12, 52
   VPSUBQ       YMM13, YMM13, [RSP+232]
@@ -1008,7 +997,7 @@ asm
   VSHUFPS      XMM14, XMM13, XMM14, $88
   VCVTDQ2PD    YMM13, XMM14
   VMULPD       YMM4,  YMM13, [RSP+328]
-  // ---- vector 1 -> YMM1 / YMM5
+  // vector 1 -> YMM1 / YMM5
   VMOVUPD      YMM12, [RDX+32]
   VPSRLQ       YMM13, YMM12, 52
   VPSUBQ       YMM13, YMM13, [RSP+232]
@@ -1025,7 +1014,7 @@ asm
   VSHUFPS      XMM14, XMM13, XMM14, $88
   VCVTDQ2PD    YMM13, XMM14
   VMULPD       YMM5,  YMM13, [RSP+328]
-  // ---- vector 2 -> YMM2 / YMM6
+  // vector 2 -> YMM2 / YMM6
   VMOVUPD      YMM12, [RDX+64]
   VPSRLQ       YMM13, YMM12, 52
   VPSUBQ       YMM13, YMM13, [RSP+232]
@@ -1042,7 +1031,7 @@ asm
   VSHUFPS      XMM14, XMM13, XMM14, $88
   VCVTDQ2PD    YMM13, XMM14
   VMULPD       YMM6,  YMM13, [RSP+328]
-  // ---- vector 3 -> YMM3 / YMM7
+  // vector 3 -> YMM3 / YMM7
   VMOVUPD      YMM12, [RDX+96]
   VPSRLQ       YMM13, YMM12, 52
   VPSUBQ       YMM13, YMM13, [RSP+232]
@@ -1059,7 +1048,7 @@ asm
   VSHUFPS      XMM14, XMM13, XMM14, $88
   VCVTDQ2PD    YMM13, XMM14
   VMULPD       YMM7,  YMM13, [RSP+328]
-  // ---- Phase 2: t = s^2 (YMM8-11), p = Horner(t) (YMM12-15), 4-way
+  // Phase 2: t = s^2 (YMM8-11), p = Horner(t) (YMM12-15), 4-way
   VMULPD       YMM8,  YMM0, YMM0
   VMULPD       YMM9,  YMM1, YMM1
   VMULPD       YMM10, YMM2, YMM2
@@ -1177,9 +1166,7 @@ begin
   end;
 end;
 
-// ---------------------------------------------------------------------------
 // AVX2+FMA helper for ScaleAddBlock: V[i] += Scalar * Src[i]
-// ---------------------------------------------------------------------------
 // Uses VFMADD231PD: dst = src1*src2 + dst  ->  V = Scalar * Src + V
 // Scalar is broadcast into YMM2 before the loop; YMM0/YMM1 are loop temps.
 // YMM0-YMM2 are all caller-saved (volatile) - no register save needed.
@@ -1208,7 +1195,7 @@ end;
 // VFMADD231PD dst,src1,mem: dst = dst + src1 * mem  ->  acc += Data * Weights
 // Four accumulators break the FMA latency chain (see AVXSumV).
 // Win64: RCX=QuadCount  RDX=Data  R8=Weights  -> result in XMM0
-function AVX2WeightedSumV(QuadCount: Integer; Data, Weights: PDouble): Double;
+Function AVX2WeightedSumV(QuadCount: Integer; Data, Weights: PDouble): Double;
 asm
   VXORPD    YMM0, YMM0, YMM0
   VXORPD    YMM1, YMM1, YMM1
@@ -1253,7 +1240,7 @@ asm
   VZEROUPPER
 end;
 
-function TVectorMathAVX2.WeightedSumBlock(Data, Weights: PDouble; Count: Integer): Double;
+Function TVectorMathAVX2.WeightedSumBlock(Data, Weights: PDouble; Count: Integer): Double;
 var Tail, I: Integer;
 begin
   Tail := Count and 3;

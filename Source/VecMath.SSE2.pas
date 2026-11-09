@@ -27,8 +27,8 @@ type
     Procedure Divide  (const Scalar: Double; const Vector, Result: TArray<Double>); overload; override;
     Procedure Divide  (const Left, Right, Result: TArray<Double>);                  overload; override;
     Procedure Sqrt    (const Vector, Result: TArray<Double>); override;
-    function  Sum     (const Vector: TArray<Double>): Double; override;
-    function  SumBlock(Data: PDouble; Count: Integer): Double; override;
+    Function  Sum     (const Vector: TArray<Double>): Double; override;
+    Function  SumBlock(Data: PDouble; Count: Integer): Double; override;
   {$ENDIF}
   end;
 
@@ -44,8 +44,6 @@ implementation
 //   Double params          : XMM0, XMM1, XMM2, XMM3 (same positional slots)
 // Each helper processes PairCount pairs of doubles (2 doubles per XMM register).
 // The Pascal wrappers handle the odd tail element with a scalar operation.
-
-// ---- vector op vector -------------------------------------------------------
 
 Procedure SSE2VAddV(PairCount: Integer; L, R, Res: PDouble);
 // RCX=PairCount  RDX=L  R8=R  R9=Res
@@ -132,7 +130,6 @@ asm
 @done:
 end;
 
-// ---- scalar op vector -------------------------------------------------------
 // Scalar arrives in XMM0 (position 0 is float).
 // PairCount in RDX, V in R8, Res in R9.
 
@@ -185,9 +182,7 @@ asm
 @done:
 end;
 
-// ---- horizontal sum ---------------------------------------------------------
-
-function SSE2SumV(PairCount: Integer; V: PDouble): Double;
+Function SSE2SumV(PairCount: Integer; V: PDouble): Double;
 // RCX=PairCount  RDX=V  -> result in XMM0
 //
 // Four accumulators (XMM0-XMM3) break the ADDPD latency chain: with a
@@ -233,8 +228,6 @@ asm
   UNPCKHPD XMM1, XMM1    // XMM1[0] = XMM0[1]
   ADDSD    XMM0, XMM1
 end;
-
-// ---- method wrappers --------------------------------------------------------
 
 Procedure TVectorMathSSE2.Add(const Scalar: Double; const Vector, Result: TArray<Double>);
 var Len: Integer;
@@ -310,7 +303,7 @@ begin
   if (Len and 1) = 1 then Result[Len-1] := System.Sqrt(Vector[Len-1]);
 end;
 
-function TVectorMathSSE2.Sum(const Vector: TArray<Double>): Double;
+Function TVectorMathSSE2.Sum(const Vector: TArray<Double>): Double;
 var Len: Integer;
 begin
   Len := Length(Vector);
@@ -321,7 +314,7 @@ begin
   if (Len and 1) = 1 then Result := Result + Vector[Len - 1];
 end;
 
-function TVectorMathSSE2.SumBlock(Data: PDouble; Count: Integer): Double;
+Function TVectorMathSSE2.SumBlock(Data: PDouble; Count: Integer): Double;
 begin
   if Count >= 2 then Result := SSE2SumV(Count shr 1, Data)
   else Result := 0.0;

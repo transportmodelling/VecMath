@@ -18,7 +18,7 @@ type
     HasAVX2: Boolean;
   end;
 
-function GetCpuFeatures: TCpuFeatures;
+Function GetCpuFeatures: TCpuFeatures;
 
 ////////////////////////////////////////////////////////////////////////////////
 implementation
@@ -49,7 +49,7 @@ asm
   POP   RBX
 end;
 
-function GetXCR0Low: Cardinal;
+Function GetXCR0Low: Cardinal;
 asm
   XOR ECX, ECX           // XCR register index 0
   XGETBV                 // result lo32 -> EAX (returned), hi32 -> EDX (ignored)
@@ -62,7 +62,7 @@ const
   EBX_AVX2    = 1 shl 5;
   XCR0_YMM   = $6;          // bits 1+2: OS saves XMM and YMM state
 
-function HasAVXSupport(const R: TCPUIDResult): Boolean;
+Function HasAVXSupport(const R: TCPUIDResult): Boolean;
 // The CPU has AVX and the OS saves the YMM state, which XGETBV reports once
 // the OS has enabled XSAVE
 begin
@@ -70,7 +70,7 @@ begin
             ((GetXCR0Low and XCR0_YMM) = XCR0_YMM);
 end;
 
-function HasAVX2Support: Boolean;
+Function HasAVX2Support: Boolean;
 var R: TCPUIDResult;
 begin
   ExecuteCPUID(7, R);
@@ -79,7 +79,7 @@ end;
 
 {$ENDIF}
 
-function GetCpuFeatures: TCpuFeatures;
+Function GetCpuFeatures: TCpuFeatures;
 {$IF DEFINED(MSWINDOWS) AND DEFINED(CPUX64)}
 var
   R: TCPUIDResult;

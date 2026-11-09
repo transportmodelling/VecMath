@@ -67,7 +67,7 @@ Type
     // TVectorMathAVX2 overrides with a fused single-pass kernel that keeps
     // all intermediates in registers and does not touch scratch memory at all.
     Procedure ExpCore(Count: Integer; V, Res: PDouble;
-      var Scratch: TScratchBuffer); virtual;
+                      var Scratch: TScratchBuffer); virtual;
     // Whether every argument of a block lies within +-EXP_LIMIT; a NaN fails.
     // TVectorMathAVX overrides with a SIMD scan.
     Function ExpInRange(Count: Integer; V: PDouble): Boolean; virtual;
@@ -93,7 +93,7 @@ Type
     Procedure Divide  (const Scalar: Double; const Vector, Result: TArray<Double>); overload; virtual;
     Procedure Divide  (const Left, Right, Result: TArray<Double>);                  overload; virtual;
     Procedure Sqrt    (const Vector, Result: TArray<Double>); virtual;
-    function  Sum     (const Vector: TArray<Double>): Double; virtual;
+    Function  Sum     (const Vector: TArray<Double>): Double; virtual;
     Procedure Exp     (const Vector, Result: TArray<Double>); overload; virtual;
     Procedure Exp     (const Vector, Result: TArray<Double>; var Scratch: TScratchBuffer); overload; virtual;
     Procedure Exp     (const Vector, Result: TArray<Double>; out Sum: Double); overload; virtual;
@@ -113,10 +113,10 @@ Type
     Procedure MultiplyByExp(const Scale: Double; const X, InOut: TArray<Double>); overload;
     Procedure MultiplyByExp(const Scale: Double; const X, InOut: TArray<Double>; var Scratch: TScratchBuffer); overload;
     // Accumulation primitives.
-    function SumBlock(Data: PDouble; Count: Integer): Double; virtual;
+    Function SumBlock(Data: PDouble; Count: Integer): Double; virtual;
     // Dot product: Sum Data[i]*Weights[i].  Weights may contain exact zeros;
     // 0*finite contributes exactly 0.
-    function WeightedSumBlock(Data, Weights: PDouble; Count: Integer): Double; virtual;
+    Function WeightedSumBlock(Data, Weights: PDouble; Count: Integer): Double; virtual;
     // Dest[i] += Scale * Src[i]  (SAXPY)
     Procedure ScaleAddBlock(Scale: Double; Count: Integer; Src, Dest: PDouble); virtual;
     // InOut[i] *= Src[i]
@@ -124,8 +124,8 @@ Type
     // Dest[i] += Scale * Src[i].
     // Thin TArray wrapper over ScaleAddBlock - the virtual lives there.
     Procedure ScaleAdd(Scale: Double; Len: Integer;
-      const Src, Dest: TArray<Double>);
-    class function CreateOptimal: TVectorMath;
+                       const Src, Dest: TArray<Double>);
+    class Function CreateOptimal: TVectorMath;
   end;
 
 Var
@@ -172,9 +172,7 @@ begin
   Result := Count > 0;
 end;
 
-// ---------------------------------------------------------------------------
-// TScratchBuffer
-// ---------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////
 
 Procedure TScratchBuffer.EnsureSize(Len: Integer);
 var I: Integer;
@@ -184,9 +182,7 @@ begin
     if Length(FDouble[I]) < Len then SetLength(FDouble[I], Len);
 end;
 
-// ---------------------------------------------------------------------------
-// TExpMoments
-// ---------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////
 
 Procedure TExpMoments.Add(const Moments: TExpMoments);
 begin
@@ -194,9 +190,29 @@ begin
   Second := Second + Moments.Second;
 end;
 
-// ---------------------------------------------------------------------------
-// TVectorMath - the scalar steps of exp and ln for one element
-// ---------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////
+
+class Function TVectorMath.CreateOptimal: TVectorMath;
+var
+  F: TCpuFeatures;
+begin
+  F := GetCpuFeatures;
+  if F.HasAVX2 then Exit(TVectorMathAVX2.Create);
+  if F.HasAVX  then Exit(TVectorMathAVX.Create);
+  if F.HasSSE2 then Exit(TVectorMathSSE2.Create);
+  Result := TVectorMath.Create;
+end;
+
+Procedure TVectorMath.ExpBlock(Count: Integer; V, Res: PDouble; var Scratch: TScratchBuffer);
+// Beyond the range of ExpCore, System.Exp overflows, underflows to a denormal
+// or zero, or passes a NaN, as the RTL does
+var I: Integer;
+begin
+  if ExpInRange(Count, V) then
+    ExpCore(Count, V, Res, Scratch)
+  else
+    for I := 0 to Count - 1 do Res[I] := System.Exp(V[I]);
+end;
 
 Function TVectorMath.ExpReduction(const X: Double; out N: Int64): Double;
 // r = x - n*ln2 with n = round(x/ln2), so |r| <= ln2/2
@@ -260,9 +276,7 @@ begin
   Result := S * Result;
 end;
 
-// ---------------------------------------------------------------------------
-// TVectorMath - scalar reduce/recon hooks (base-class defaults)
-// ---------------------------------------------------------------------------
+// The scalar defaults of the reduce, reconstruct and Horner hooks
 
 Procedure TVectorMath.ExpReduce(QuadCount: Integer; V, R: PDouble; N: PInt64);
 var I: Integer;
@@ -282,9 +296,81 @@ begin
   for I := 0 to QuadCount * 4 - 1 do S[I] := LogReduction(V[I], NLn2[I]);
 end;
 
-// ---------------------------------------------------------------------------
-// TVectorMath - scalar element-wise defaults (subclasses override with SIMD)
-// ---------------------------------------------------------------------------
+Procedure TVectorMath.ExpHorner(Count: Integer; R, P: PDouble);
+var I: Integer;
+begin
+  for I := 0 to Count - 1 do P[I] := ExpPolynomial(R[I]);
+end;
+
+Procedure TVectorMath.LogHorner(Count: Integer; S, NLn2, Res: PDouble);
+var I: Integer;
+begin
+  for I := 0 to Count - 1 do Res[I] := LogPolynomial(S[I]) + NLn2[I];
+end;
+
+Procedure TVectorMath.ExpCore(Count: Integer; V, Res: PDouble;
+                              var Scratch: TScratchBuffer);
+// Three-pass exp pipeline: reduce -> Horner -> reconstruct, each dispatching to
+// the subclass virtuals, with a scalar tail after the full groups of 4.
+// Uses FDouble[1] as R, FDouble[2] as P, FInt64 as N.
+var
+  FullQuads, I: Integer;
+  R, P: TArray<Double>;
+begin
+  FullQuads := Count shr 2;
+  R := Scratch.FDouble[1];
+  P := Scratch.FDouble[2];
+  if FullQuads > 0 then ExpReduce(FullQuads, V, @R[0], @Scratch.FInt64[0]);
+  for I := FullQuads shl 2 to Count - 1 do R[I] := ExpReduction(V[I], Scratch.FInt64[I]);
+  ExpHorner(Count, @R[0], @P[0]);
+  if FullQuads > 0 then ExpRecon(FullQuads, @P[0], @Scratch.FInt64[0], Res);
+  for I := FullQuads shl 2 to Count - 1 do Res[I] := P[I] * PowerOfTwo(Scratch.FInt64[I]);
+end;
+
+Function TVectorMath.ExpInRange(Count: Integer; V: PDouble): Boolean;
+var I: Integer;
+begin
+  for I := 0 to Count - 1 do
+    if not (Abs(V[I]) <= EXP_LIMIT) then Exit(false);
+  Result := true;
+end;
+
+Procedure TVectorMath.MaskedScaleBlock(const Scale: Double; Count: Integer; X, Mask, Res: PDouble);
+var I: Integer;
+begin
+  for I := 0 to Count - 1 do
+    if Mask[I] <> 0.0 then Res[I] := Scale * X[I] else Res[I] := 0.0;
+end;
+
+Function TVectorMath.ExpMomentsBlock(Count: Integer; X, W, E: PDouble): TExpMoments;
+var I: Integer; T: Double;
+begin
+  Result := Default(TExpMoments);
+  for I := 0 to Count - 1 do
+    if W[I] <> 0.0 then
+    begin
+      T := W[I] * X[I] * E[I];
+      Result.First := Result.First + T;
+      Result.Second := Result.Second + T * X[I];
+    end;
+end;
+
+Procedure TVectorMath.LogCore(Count: Integer; X, Res, S, NLn2: PDouble);
+// Two-pass ln pipeline: argument reduction then Horner, each dispatching to
+// the subclass virtuals.  S and NLn2 are workspace of at least Count elements.
+var FullQuads, I: Integer;
+begin
+  FullQuads := Count shr 2;
+  // Vectorised argument-reduction for full groups of 4, then the scalar tail
+  if FullQuads > 0 then
+    LogReduce(FullQuads, X, S, NLn2);
+  for I := FullQuads shl 2 to Count - 1 do S[I] := LogReduction(X[I], NLn2[I]);
+  // Single-pass Horner: t=s^2, g(t) polynomial, result = s*g(t) + nln2.
+  LogHorner(Count, S, NLn2, Res);
+end;
+
+// The scalar defaults of the element-wise operations, which the SIMD
+// subclasses override
 
 Procedure TVectorMath.Add(const Scalar: Double; const Vector, Result: TArray<Double>);
 var V, R: PDouble; N: Integer;
@@ -350,7 +436,7 @@ begin
   while N > 0 do begin R^ := System.Sqrt(V^); Inc(V); Inc(R); Dec(N); end;
 end;
 
-function TVectorMath.Sum(const Vector: TArray<Double>): Double;
+Function TVectorMath.Sum(const Vector: TArray<Double>): Double;
 var V: PDouble; N: Integer;
 begin
   Result := 0.0;
@@ -358,19 +444,115 @@ begin
   while N > 0 do begin Result := Result + V^; Inc(V); Dec(N); end;
 end;
 
-Procedure TVectorMath.ExpHorner(Count: Integer; R, P: PDouble);
-var I: Integer;
+Procedure TVectorMath.Exp(const Vector, Result: TArray<Double>);
+var Scratch: TScratchBuffer;
 begin
-  for I := 0 to Count - 1 do P[I] := ExpPolynomial(R[I]);
+  Exp(Vector, Result, Scratch);
 end;
 
-Procedure TVectorMath.LogHorner(Count: Integer; S, NLn2, Res: PDouble);
-var I: Integer;
+Procedure TVectorMath.Exp(const Vector, Result: TArray<Double>; var Scratch: TScratchBuffer);
+// Cache-blocked polynomial exp(x) = 2^n * exp(r),  n = round(x/ln2),  |r| <= ln2/2
+//
+// Each block fits in L1 cache, so all pipeline stages hit L1 rather than
+// making separate passes through main memory.  Accuracy: ~1-2 ULP.
+//
+// ExpBlock dispatches to the subclass (fused SIMD or scalar three-pass), or to
+// System.Exp for a block with an argument beyond +-EXP_LIMIT.
+var Blocks: TBlocks;
 begin
-  for I := 0 to Count - 1 do Res[I] := LogPolynomial(S[I]) + NLn2[I];
+  Scratch.EnsureSize(EXP_LOG_BLOCK);
+  Blocks := TBlocks.Create(System.Length(Vector));
+  while Blocks.Next do
+    ExpBlock(Blocks.Count, @Vector[Blocks.Start], @Result[Blocks.Start], Scratch);
 end;
 
-function TVectorMath.SumBlock(Data: PDouble; Count: Integer): Double;
+Procedure TVectorMath.Exp(const Vector, Result: TArray<Double>; out Sum: Double);
+var Scratch: TScratchBuffer;
+begin
+  Exp(Vector, Result, Sum, Scratch);
+end;
+
+Procedure TVectorMath.Exp(const Vector, Result: TArray<Double>; out Sum: Double; var Scratch: TScratchBuffer);
+// Fused Exp + Sum: identical block loop to Exp(V,R,Scratch) with an extra
+// accumulation step over each block while it is still L1-resident.
+var Blocks: TBlocks;
+begin
+  Sum := 0.0;
+  Scratch.EnsureSize(EXP_LOG_BLOCK);
+  Blocks := TBlocks.Create(System.Length(Vector));
+  while Blocks.Next do
+  begin
+    ExpBlock(Blocks.Count, @Vector[Blocks.Start], @Result[Blocks.Start], Scratch);
+    Sum := Sum + SumBlock(@Result[Blocks.Start], Blocks.Count);
+  end;
+end;
+
+Procedure TVectorMath.Log(const Vector, Result: TArray<Double>);
+var Scratch: TScratchBuffer;
+begin
+  Log(Vector, Result, Scratch);
+end;
+
+Procedure TVectorMath.Log(const Vector, Result: TArray<Double>; var Scratch: TScratchBuffer);
+// Cache-blocked polynomial log(x) = n*ln2 + log(m),  x = 2^n * m,
+// m in [sqrt(2)/2, sqrt(2)).  log(m) = 2*s*f(t),  s=(m-1)/(m+1),  t=s^2.
+// f(t) = 1 + t/3 + t^2/5 + t^3/7 + t^4/9 + t^5/11 + t^6/13 + t^7/15
+// |s| <= 0.172  ->  ~15 digit accuracy with 8 terms.
+//
+// LogCore dispatches to the subclass (fused SIMD or scalar two-pass).
+var Blocks: TBlocks;
+begin
+  Scratch.EnsureSize(EXP_LOG_BLOCK);
+  Blocks := TBlocks.Create(System.Length(Vector));
+  while Blocks.Next do
+    LogCore(Blocks.Count, @Vector[Blocks.Start], @Result[Blocks.Start],
+            @Scratch.FDouble[0][0], @Scratch.FDouble[3][0]);
+end;
+
+// ExpMoments and MultiplyByExp: per block, the masked arguments Scale*X go to
+// Scratch.FDouble[0] and their exponentials to FDouble[3]
+
+Function TVectorMath.ExpMoments(const Scale: Double; const X, W: TArray<Double>): TExpMoments;
+var Scratch: TScratchBuffer;
+begin
+  Result := ExpMoments(Scale, X, W, Scratch);
+end;
+
+Function TVectorMath.ExpMoments(const Scale: Double; const X, W: TArray<Double>; var Scratch: TScratchBuffer): TExpMoments;
+var Blocks: TBlocks;
+begin
+  Result := Default(TExpMoments);
+  Scratch.EnsureSize(EXP_LOG_BLOCK);
+  Blocks := TBlocks.Create(System.Length(X));
+  while Blocks.Next do
+  begin
+    MaskedScaleBlock(Scale, Blocks.Count, @X[Blocks.Start], @W[Blocks.Start], @Scratch.FDouble[0][0]);
+    ExpBlock(Blocks.Count, @Scratch.FDouble[0][0], @Scratch.FDouble[3][0], Scratch);
+    Result.Add(ExpMomentsBlock(Blocks.Count, @X[Blocks.Start], @W[Blocks.Start], @Scratch.FDouble[3][0]));
+  end;
+end;
+
+Procedure TVectorMath.MultiplyByExp(const Scale: Double; const X, InOut: TArray<Double>);
+var Scratch: TScratchBuffer;
+begin
+  MultiplyByExp(Scale, X, InOut, Scratch);
+end;
+
+Procedure TVectorMath.MultiplyByExp(const Scale: Double; const X, InOut: TArray<Double>; var Scratch: TScratchBuffer);
+// An element with InOut[i] = 0 has argument 0 and factor 1
+var Blocks: TBlocks;
+begin
+  Scratch.EnsureSize(EXP_LOG_BLOCK);
+  Blocks := TBlocks.Create(System.Length(X));
+  while Blocks.Next do
+  begin
+    MaskedScaleBlock(Scale, Blocks.Count, @X[Blocks.Start], @InOut[Blocks.Start], @Scratch.FDouble[0][0]);
+    ExpBlock(Blocks.Count, @Scratch.FDouble[0][0], @Scratch.FDouble[3][0], Scratch);
+    MultiplyBlock(Blocks.Count, @Scratch.FDouble[3][0], @InOut[Blocks.Start]);
+  end;
+end;
+
+Function TVectorMath.SumBlock(Data: PDouble; Count: Integer): Double;
 var S0, S1, S2, S3: Double; I: Integer;
 begin
   S0 := 0.0; S1 := 0.0; S2 := 0.0; S3 := 0.0; I := 0;
@@ -384,7 +566,7 @@ begin
   Result := (S0 + S1) + (S2 + S3);
 end;
 
-function TVectorMath.WeightedSumBlock(Data, Weights: PDouble; Count: Integer): Double;
+Function TVectorMath.WeightedSumBlock(Data, Weights: PDouble; Count: Integer): Double;
 // Four-way unrolled dot product: Sum Data[i] * Weights[i].
 // Weights[i] = 0 -> contributes exactly 0 (IEEE 754 guarantees 0 * finite = 0).
 var S0, S1, S2, S3: Double; I: Integer;
@@ -435,212 +617,9 @@ begin
 end;
 
 Procedure TVectorMath.ScaleAdd(Scale: Double; Len: Integer;
-  const Src, Dest: TArray<Double>);
+                               const Src, Dest: TArray<Double>);
 begin
   ScaleAddBlock(Scale, Len, Pointer(Src), Pointer(Dest));
-end;
-
-// ---------------------------------------------------------------------------
-// TVectorMath.Exponentiate
-// ---------------------------------------------------------------------------
-
-Procedure TVectorMath.Exp(const Vector, Result: TArray<Double>);
-var Scratch: TScratchBuffer;
-begin
-  Exp(Vector, Result, Scratch);
-end;
-
-Procedure TVectorMath.Exp(const Vector, Result: TArray<Double>; var Scratch: TScratchBuffer);
-// Cache-blocked polynomial exp(x) = 2^n * exp(r),  n = round(x/ln2),  |r| <= ln2/2
-//
-// Each block fits in L1 cache, so all pipeline stages hit L1 rather than
-// making separate passes through main memory.  Accuracy: ~1-2 ULP.
-//
-// ExpBlock dispatches to the subclass (fused SIMD or scalar three-pass), or to
-// System.Exp for a block with an argument beyond +-EXP_LIMIT.
-var Blocks: TBlocks;
-begin
-  Scratch.EnsureSize(EXP_LOG_BLOCK);
-  Blocks := TBlocks.Create(System.Length(Vector));
-  while Blocks.Next do
-    ExpBlock(Blocks.Count, @Vector[Blocks.Start], @Result[Blocks.Start], Scratch);
-end;
-
-Procedure TVectorMath.Exp(const Vector, Result: TArray<Double>; out Sum: Double);
-var Scratch: TScratchBuffer;
-begin
-  Exp(Vector, Result, Sum, Scratch);
-end;
-
-Procedure TVectorMath.Exp(const Vector, Result: TArray<Double>; out Sum: Double; var Scratch: TScratchBuffer);
-// Fused Exp + Sum: identical block loop to Exp(V,R,Scratch) with an extra
-// accumulation step over each block while it is still L1-resident.
-var Blocks: TBlocks;
-begin
-  Sum := 0.0;
-  Scratch.EnsureSize(EXP_LOG_BLOCK);
-  Blocks := TBlocks.Create(System.Length(Vector));
-  while Blocks.Next do
-  begin
-    ExpBlock(Blocks.Count, @Vector[Blocks.Start], @Result[Blocks.Start], Scratch);
-    Sum := Sum + SumBlock(@Result[Blocks.Start], Blocks.Count);
-  end;
-end;
-
-// ---------------------------------------------------------------------------
-// TVectorMath.Log
-// ---------------------------------------------------------------------------
-
-Procedure TVectorMath.Log(const Vector, Result: TArray<Double>);
-var Scratch: TScratchBuffer;
-begin
-  Log(Vector, Result, Scratch);
-end;
-
-Procedure TVectorMath.Log(const Vector, Result: TArray<Double>; var Scratch: TScratchBuffer);
-// Cache-blocked polynomial log(x) = n*ln2 + log(m),  x = 2^n * m,
-// m in [sqrt(2)/2, sqrt(2)).  log(m) = 2*s*f(t),  s=(m-1)/(m+1),  t=s^2.
-// f(t) = 1 + t/3 + t^2/5 + t^3/7 + t^4/9 + t^5/11 + t^6/13 + t^7/15
-// |s| <= 0.172  ->  ~15 digit accuracy with 8 terms.
-//
-// LogCore dispatches to the subclass (fused SIMD or scalar two-pass).
-var Blocks: TBlocks;
-begin
-  Scratch.EnsureSize(EXP_LOG_BLOCK);
-  Blocks := TBlocks.Create(System.Length(Vector));
-  while Blocks.Next do
-    LogCore(Blocks.Count, @Vector[Blocks.Start], @Result[Blocks.Start],
-      @Scratch.FDouble[0][0], @Scratch.FDouble[3][0]);
-end;
-
-Procedure TVectorMath.LogCore(Count: Integer; X, Res, S, NLn2: PDouble);
-// Two-pass ln pipeline: argument reduction then Horner, each dispatching to
-// the subclass virtuals.  S and NLn2 are workspace of at least Count elements.
-var FullQuads, I: Integer;
-begin
-  FullQuads := Count shr 2;
-  // Vectorised argument-reduction for full groups of 4, then the scalar tail
-  if FullQuads > 0 then
-    LogReduce(FullQuads, X, S, NLn2);
-  for I := FullQuads shl 2 to Count - 1 do S[I] := LogReduction(X[I], NLn2[I]);
-  // Single-pass Horner: t=s^2, g(t) polynomial, result = s*g(t) + nln2.
-  LogHorner(Count, S, NLn2, Res);
-end;
-
-Procedure TVectorMath.ExpCore(Count: Integer; V, Res: PDouble;
-  var Scratch: TScratchBuffer);
-// Three-pass exp pipeline: reduce -> Horner -> reconstruct, each dispatching to
-// the subclass virtuals, with a scalar tail after the full groups of 4.
-// Uses FDouble[1] as R, FDouble[2] as P, FInt64 as N.
-var
-  FullQuads, I: Integer;
-  R, P: TArray<Double>;
-begin
-  FullQuads := Count shr 2;
-  R := Scratch.FDouble[1];
-  P := Scratch.FDouble[2];
-  if FullQuads > 0 then ExpReduce(FullQuads, V, @R[0], @Scratch.FInt64[0]);
-  for I := FullQuads shl 2 to Count - 1 do R[I] := ExpReduction(V[I], Scratch.FInt64[I]);
-  ExpHorner(Count, @R[0], @P[0]);
-  if FullQuads > 0 then ExpRecon(FullQuads, @P[0], @Scratch.FInt64[0], Res);
-  for I := FullQuads shl 2 to Count - 1 do Res[I] := P[I] * PowerOfTwo(Scratch.FInt64[I]);
-end;
-
-Function TVectorMath.ExpInRange(Count: Integer; V: PDouble): Boolean;
-var I: Integer;
-begin
-  for I := 0 to Count - 1 do
-    if not (Abs(V[I]) <= EXP_LIMIT) then Exit(false);
-  Result := true;
-end;
-
-Procedure TVectorMath.ExpBlock(Count: Integer; V, Res: PDouble; var Scratch: TScratchBuffer);
-// Beyond the range of ExpCore, System.Exp overflows, underflows to a denormal
-// or zero, or passes a NaN, as the RTL does
-var I: Integer;
-begin
-  if ExpInRange(Count, V) then
-    ExpCore(Count, V, Res, Scratch)
-  else
-    for I := 0 to Count - 1 do Res[I] := System.Exp(V[I]);
-end;
-
-Procedure TVectorMath.MaskedScaleBlock(const Scale: Double; Count: Integer; X, Mask, Res: PDouble);
-var I: Integer;
-begin
-  for I := 0 to Count - 1 do
-    if Mask[I] <> 0.0 then Res[I] := Scale * X[I] else Res[I] := 0.0;
-end;
-
-Function TVectorMath.ExpMomentsBlock(Count: Integer; X, W, E: PDouble): TExpMoments;
-var I: Integer; T: Double;
-begin
-  Result := Default(TExpMoments);
-  for I := 0 to Count - 1 do
-    if W[I] <> 0.0 then
-    begin
-      T := W[I] * X[I] * E[I];
-      Result.First := Result.First + T;
-      Result.Second := Result.Second + T * X[I];
-    end;
-end;
-
-// ---------------------------------------------------------------------------
-// TVectorMath.ExpMoments and MultiplyByExp: per block, the masked arguments
-// Scale*X go to Scratch.FDouble[0] and their exponentials to FDouble[3]
-// ---------------------------------------------------------------------------
-
-Function TVectorMath.ExpMoments(const Scale: Double; const X, W: TArray<Double>): TExpMoments;
-var Scratch: TScratchBuffer;
-begin
-  Result := ExpMoments(Scale, X, W, Scratch);
-end;
-
-Function TVectorMath.ExpMoments(const Scale: Double; const X, W: TArray<Double>; var Scratch: TScratchBuffer): TExpMoments;
-var Blocks: TBlocks;
-begin
-  Result := Default(TExpMoments);
-  Scratch.EnsureSize(EXP_LOG_BLOCK);
-  Blocks := TBlocks.Create(System.Length(X));
-  while Blocks.Next do
-  begin
-    MaskedScaleBlock(Scale, Blocks.Count, @X[Blocks.Start], @W[Blocks.Start], @Scratch.FDouble[0][0]);
-    ExpBlock(Blocks.Count, @Scratch.FDouble[0][0], @Scratch.FDouble[3][0], Scratch);
-    Result.Add(ExpMomentsBlock(Blocks.Count, @X[Blocks.Start], @W[Blocks.Start], @Scratch.FDouble[3][0]));
-  end;
-end;
-
-Procedure TVectorMath.MultiplyByExp(const Scale: Double; const X, InOut: TArray<Double>);
-var Scratch: TScratchBuffer;
-begin
-  MultiplyByExp(Scale, X, InOut, Scratch);
-end;
-
-Procedure TVectorMath.MultiplyByExp(const Scale: Double; const X, InOut: TArray<Double>; var Scratch: TScratchBuffer);
-// An element with InOut[i] = 0 has argument 0 and factor 1
-var Blocks: TBlocks;
-begin
-  Scratch.EnsureSize(EXP_LOG_BLOCK);
-  Blocks := TBlocks.Create(System.Length(X));
-  while Blocks.Next do
-  begin
-    MaskedScaleBlock(Scale, Blocks.Count, @X[Blocks.Start], @InOut[Blocks.Start], @Scratch.FDouble[0][0]);
-    ExpBlock(Blocks.Count, @Scratch.FDouble[0][0], @Scratch.FDouble[3][0], Scratch);
-    MultiplyBlock(Blocks.Count, @Scratch.FDouble[3][0], @InOut[Blocks.Start]);
-  end;
-end;
-
-// ---------------------------------------------------------------------------
-
-class function TVectorMath.CreateOptimal: TVectorMath;
-var
-  F: TCpuFeatures;
-begin
-  F := GetCpuFeatures;
-  if F.HasAVX2 then Exit(TVectorMathAVX2.Create);
-  if F.HasAVX  then Exit(TVectorMathAVX.Create);
-  if F.HasSSE2 then Exit(TVectorMathSSE2.Create);
-  Result := TVectorMath.Create;
 end;
 
 initialization

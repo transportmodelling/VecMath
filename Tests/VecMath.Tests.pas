@@ -68,11 +68,7 @@ const
   LENS: array[0..13] of Integer =
     (1, 2, 3, 4, 5, 7, 15, 16, 17, 511, 512, 513, 1000, 2048);
 
-// ---------------------------------------------------------------------------
-// Helpers
-// ---------------------------------------------------------------------------
-
-function RandomArray(Len: Integer; Lo, Hi: Double): TArray<Double>;
+Function RandomArray(Len: Integer; Lo, Hi: Double): TArray<Double>;
 var I: Integer;
 begin
   SetLength(Result, Len);
@@ -82,14 +78,12 @@ end;
 
 // Relative error with an absolute floor: near-zero references are compared
 // absolutely (relevant for Log results near ln(1) = 0).
-function RelErr(Actual, Ref: Double): Double;
+Function RelErr(Actual, Ref: Double): Double;
 begin
   Result := Abs(Actual - Ref) / Max(1.0, Abs(Ref));
 end;
 
-// ---------------------------------------------------------------------------
-// TVectorMathTests
-// ---------------------------------------------------------------------------
+////////////////////////////////////////////////////////////////////////////////
 
 Procedure TVectorMathTests.AddEngine(Engine: TVectorMath; const Name: string);
 begin
@@ -461,9 +455,9 @@ begin
     begin
       M := FEngines[E].ExpMoments(0.37, X, W);
       Assert.IsTrue(RelErr(M.First, Ref.First) <= 1e-12, Format('%s ExpMoments.First Len=%d: %.17g <> ref %.17g',
-                                                                  [FNames[E], LENS[L], M.First, Ref.First]));
+                                                                [FNames[E], LENS[L], M.First, Ref.First]));
       Assert.IsTrue(RelErr(M.Second, Ref.Second) <= 1e-12, Format('%s ExpMoments.Second Len=%d: %.17g <> ref %.17g',
-                                                                    [FNames[E], LENS[L], M.Second, Ref.Second]));
+                                                                  [FNames[E], LENS[L], M.Second, Ref.Second]));
     end;
   end;
 end;
