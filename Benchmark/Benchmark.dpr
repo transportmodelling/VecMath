@@ -22,8 +22,6 @@ uses
 type
   TBenchProc    = reference to Procedure;
 
-  PScratchBuffer = ^TScratchBuffer;
-
 const
   WARMUP_ITERS = 5;
   MIN_ITERS    = 3;
@@ -118,9 +116,14 @@ begin
   while N > 0 do begin D^ := Ln(S^); Inc(S); Inc(D); Dec(N); end;
 end;
 
+var
+  // The scratch buffers of the engines, reused over the array sizes. The
+  // benchmark closures use them as variables of the program: an anonymous
+  // method cannot capture a var parameter.
+  ScScratch, S2Scratch, AvScratch, Av2Scratch: TScratchBuffer;
+
 Procedure RunBenchmarks(Size: Integer;
-                        Sc: TVectorMath; S2: TVectorMathSSE2; Av: TVectorMathAVX; Av2: TVectorMathAVX2;
-                        ScScratch, S2Scratch, AvScratch, Av2Scratch: PScratchBuffer);
+                        Sc: TVectorMath; S2: TVectorMathSSE2; Av: TVectorMathAVX; Av2: TVectorMathAVX2);
 var
   A, B, C: TArray<Double>;
   ScUs, S2Us, AvUs, Av2Us: Double;
@@ -214,17 +217,17 @@ begin
   PrintRow('Exp', ScUs, S2Us, AvUs, Av2Us);
 
   // Exp with reused scratch buffer
-  ScUs  := BenchmarkUs(Procedure begin Sc.Exp(A, C, ScScratch^) end);
-  S2Us  := BenchmarkUs(Procedure begin S2.Exp(A, C, S2Scratch^) end);
-  AvUs  := BenchmarkUs(Procedure begin Av.Exp(A, C, AvScratch^) end);
-  Av2Us := BenchmarkUs(Procedure begin Av2.Exp(A, C, Av2Scratch^) end);
+  ScUs  := BenchmarkUs(Procedure begin Sc.Exp(A, C, ScScratch) end);
+  S2Us  := BenchmarkUs(Procedure begin S2.Exp(A, C, S2Scratch) end);
+  AvUs  := BenchmarkUs(Procedure begin Av.Exp(A, C, AvScratch) end);
+  Av2Us := BenchmarkUs(Procedure begin Av2.Exp(A, C, Av2Scratch) end);
   PrintRow('Exp (scratch)', ScUs, S2Us, AvUs, Av2Us);
 
   // Fused Exp + Sum
-  ScUs  := BenchmarkUs(Procedure begin Sc.Exp(A, C, ExpSum, ScScratch^) end);
-  S2Us  := BenchmarkUs(Procedure begin S2.Exp(A, C, ExpSum, S2Scratch^) end);
-  AvUs  := BenchmarkUs(Procedure begin Av.Exp(A, C, ExpSum, AvScratch^) end);
-  Av2Us := BenchmarkUs(Procedure begin Av2.Exp(A, C, ExpSum, Av2Scratch^) end);
+  ScUs  := BenchmarkUs(Procedure begin Sc.Exp(A, C, ExpSum, ScScratch) end);
+  S2Us  := BenchmarkUs(Procedure begin S2.Exp(A, C, ExpSum, S2Scratch) end);
+  AvUs  := BenchmarkUs(Procedure begin Av.Exp(A, C, ExpSum, AvScratch) end);
+  Av2Us := BenchmarkUs(Procedure begin Av2.Exp(A, C, ExpSum, Av2Scratch) end);
   PrintRow('Exp+Sum (fused)', ScUs, S2Us, AvUs, Av2Us);
 
   // Log (polynomial via base class)
@@ -237,10 +240,10 @@ begin
   PrintRow('Log', ScUs, S2Us, AvUs, Av2Us);
 
   // Log with reused scratch buffer
-  ScUs  := BenchmarkUs(Procedure begin Sc.Log(A, C, ScScratch^) end);
-  S2Us  := BenchmarkUs(Procedure begin S2.Log(A, C, S2Scratch^) end);
-  AvUs  := BenchmarkUs(Procedure begin Av.Log(A, C, AvScratch^) end);
-  Av2Us := BenchmarkUs(Procedure begin Av2.Log(A, C, Av2Scratch^) end);
+  ScUs  := BenchmarkUs(Procedure begin Sc.Log(A, C, ScScratch) end);
+  S2Us  := BenchmarkUs(Procedure begin S2.Log(A, C, S2Scratch) end);
+  AvUs  := BenchmarkUs(Procedure begin Av.Log(A, C, AvScratch) end);
+  Av2Us := BenchmarkUs(Procedure begin Av2.Log(A, C, Av2Scratch) end);
   PrintRow('Log (scratch)', ScUs, S2Us, AvUs, Av2Us);
 
   Writeln;
@@ -254,10 +257,6 @@ var
   S2:         TVectorMathSSE2;
   Av:         TVectorMathAVX;
   Av2:        TVectorMathAVX2;
-  ScScratch:  TScratchBuffer;
-  S2Scratch:  TScratchBuffer;
-  AvScratch:  TScratchBuffer;
-  Av2Scratch: TScratchBuffer;
 
 begin
   try
@@ -276,10 +275,10 @@ begin
     Av   := TVectorMathAVX.Create;
     Av2  := TVectorMathAVX2.Create;
     try
-      RunBenchmarks(        1_000, Sc, S2, Av, Av2, @ScScratch, @S2Scratch, @AvScratch, @Av2Scratch);
-      RunBenchmarks(       10_000, Sc, S2, Av, Av2, @ScScratch, @S2Scratch, @AvScratch, @Av2Scratch);
-      RunBenchmarks(      100_000, Sc, S2, Av, Av2, @ScScratch, @S2Scratch, @AvScratch, @Av2Scratch);
-      RunBenchmarks(    1_000_000, Sc, S2, Av, Av2, @ScScratch, @S2Scratch, @AvScratch, @Av2Scratch);
+      RunBenchmarks(        1_000, Sc, S2, Av, Av2);
+      RunBenchmarks(       10_000, Sc, S2, Av, Av2);
+      RunBenchmarks(      100_000, Sc, S2, Av, Av2);
+      RunBenchmarks(    1_000_000, Sc, S2, Av, Av2);
     finally
       Sc.Free;
       S2.Free;

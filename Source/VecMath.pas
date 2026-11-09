@@ -197,10 +197,14 @@ var
   F: TCpuFeatures;
 begin
   F := GetCpuFeatures;
-  if F.HasAVX2 then Exit(TVectorMathAVX2.Create);
-  if F.HasAVX  then Exit(TVectorMathAVX.Create);
-  if F.HasSSE2 then Exit(TVectorMathSSE2.Create);
-  Result := TVectorMath.Create;
+  if F.HasAVX2 then
+    Result := TVectorMathAVX2.Create
+  else if F.HasAVX then
+    Result := TVectorMathAVX.Create
+  else if F.HasSSE2 then
+    Result := TVectorMathSSE2.Create
+  else
+    Result := TVectorMath.Create;
 end;
 
 Procedure TVectorMath.ExpBlock(Count: Integer; V, Res: PDouble; var Scratch: TScratchBuffer);
@@ -223,8 +227,8 @@ end;
 
 Function TVectorMath.ExpPolynomial(const R: Double): Double;
 // Degree-12 Taylor: truncation error r^13/13! ~ 1.7e-16 at |r| = ln2/2, so the
-// polynomial itself contributes ~1 ulp.  (Degree 10 looked sufficient but its
-// truncation error is ~2e-13 - caught by Exp_MatchesSystemExp.)
+// polynomial itself contributes ~1 ulp; degree 10 would leave ~2e-13, which
+// Exp_MatchesSystemExp rejects.
 begin
   Result := R * (1.0/479001600.0) + (1.0/39916800.0);
   Result := R * Result + (1.0/3628800.0);

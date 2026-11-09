@@ -38,6 +38,10 @@ type
     FEngines: TArray<TVectorMath>;
     FNames:   TArray<string>;
     Procedure AddEngine(Engine: TVectorMath; const Name: string);
+    Function RandomArray(Len: Integer; Lo, Hi: Double): TArray<Double>;
+    Function RelErr(Actual, Ref: Double): Double;
+    Procedure MaskEveryThird(const X, W: TArray<Double>);
+    Function NaiveExpMoments(const Scale: Double; const X, W: TArray<Double>): TExpMoments;
   public
     [Setup]    Procedure Setup;
     [TearDown] Procedure TearDown;
@@ -68,7 +72,13 @@ const
   LENS: array[0..13] of Integer =
     (1, 2, 3, 4, 5, 7, 15, 16, 17, 511, 512, 513, 1000, 2048);
 
-Function RandomArray(Len: Integer; Lo, Hi: Double): TArray<Double>;
+Procedure TVectorMathTests.AddEngine(Engine: TVectorMath; const Name: string);
+begin
+  FEngines := FEngines + [Engine];
+  FNames   := FNames + [Name];
+end;
+
+Function TVectorMathTests.RandomArray(Len: Integer; Lo, Hi: Double): TArray<Double>;
 var I: Integer;
 begin
   SetLength(Result, Len);
@@ -78,17 +88,40 @@ end;
 
 // Relative error with an absolute floor: near-zero references are compared
 // absolutely (relevant for Log results near ln(1) = 0).
-Function RelErr(Actual, Ref: Double): Double;
+Function TVectorMathTests.RelErr(Actual, Ref: Double): Double;
 begin
   Result := Abs(Actual - Ref) / Max(1.0, Abs(Ref));
 end;
 
-////////////////////////////////////////////////////////////////////////////////
-
-Procedure TVectorMathTests.AddEngine(Engine: TVectorMath; const Name: string);
+// Weights with exact zeros at every third element, where X holds values that
+// must not be used: a huge value, an infinity and a NaN
+Procedure TVectorMathTests.MaskEveryThird(const X, W: TArray<Double>);
+var I: Integer;
 begin
-  FEngines := FEngines + [Engine];
-  FNames   := FNames + [Name];
+  for I := 0 to High(W) do
+    if I mod 3 = 0 then
+    begin
+      W[I] := 0.0;
+      case (I div 3) mod 3 of
+        0: X[I] := MaxDouble;
+        1: X[I] := Infinity;
+        else X[I] := NaN;
+      end;
+    end;
+end;
+
+// Sum W*X*exp(Scale*X) and Sum W*X^2*exp(Scale*X) over W <> 0, with System.Exp
+Function TVectorMathTests.NaiveExpMoments(const Scale: Double; const X, W: TArray<Double>): TExpMoments;
+var I: Integer; T: Double;
+begin
+  Result := Default(TExpMoments);
+  for I := 0 to High(X) do
+    if W[I] <> 0.0 then
+    begin
+      T := W[I] * X[I] * System.Exp(Scale * X[I]);
+      Result.First := Result.First + T;
+      Result.Second := Result.Second + T * X[I];
+    end;
 end;
 
 Procedure TVectorMathTests.Setup;
@@ -405,37 +438,6 @@ begin
   finally
     SetExceptionMask(Mask);
   end;
-end;
-
-// Weights with exact zeros at every third element, where X holds values that
-// must not be used: a huge value, an infinity and a NaN
-Procedure MaskEveryThird(const X, W: TArray<Double>);
-var I: Integer;
-begin
-  for I := 0 to High(W) do
-    if I mod 3 = 0 then
-    begin
-      W[I] := 0.0;
-      case (I div 3) mod 3 of
-        0: X[I] := MaxDouble;
-        1: X[I] := Infinity;
-        else X[I] := NaN;
-      end;
-    end;
-end;
-
-// Sum W*X*exp(Scale*X) and Sum W*X^2*exp(Scale*X) over W <> 0, with System.Exp
-Function NaiveExpMoments(const Scale: Double; const X, W: TArray<Double>): TExpMoments;
-var I: Integer; T: Double;
-begin
-  Result := Default(TExpMoments);
-  for I := 0 to High(X) do
-    if W[I] <> 0.0 then
-    begin
-      T := W[I] * X[I] * System.Exp(Scale * X[I]);
-      Result.First := Result.First + T;
-      Result.Second := Result.Second + T * X[I];
-    end;
 end;
 
 Procedure TVectorMathTests.ExpMoments_MatchesNaiveReference;
