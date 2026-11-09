@@ -59,6 +59,7 @@ const
   EDX_SSE2    = 1 shl 26;
   ECX_OSXSAVE = 1 shl 27;  // OS has enabled XSAVE - required before XGETBV
   ECX_AVX     = 1 shl 28;
+  ECX_AVX_OSXSAVE = ECX_OSXSAVE or ECX_AVX;
   EBX_AVX2    = 1 shl 5;
   XCR0_YMM   = $6;          // bits 1+2: OS saves XMM and YMM state
 
@@ -66,7 +67,7 @@ Function HasAVXSupport(const R: TCPUIDResult): Boolean;
 // The CPU has AVX and the OS saves the YMM state, which XGETBV reports once
 // the OS has enabled XSAVE
 begin
-  Result := ((R.ECX and ECX_OSXSAVE) <> 0) and ((R.ECX and ECX_AVX) <> 0) and
+  Result := ((R.ECX and ECX_AVX_OSXSAVE) = ECX_AVX_OSXSAVE) and
             ((GetXCR0Low and XCR0_YMM) = XCR0_YMM);
 end;
 
