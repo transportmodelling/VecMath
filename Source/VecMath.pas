@@ -26,6 +26,19 @@ Type
   end;
 
   TVectorMath = class abstract
+  strict private
+    Type
+      // Steps through an array of Length elements in blocks of EXP_LOG_BLOCK
+      TBlocks = record
+        Start,Count,Length: Integer;
+        Constructor Create(ArrayLength: Integer);
+        Function Next: Boolean;
+      end;
+    // Block size for cache-blocked operations.
+    // Working arrays (V, R, P, NLn2, N) fit in L1 cache (typically 32 KB):
+    //   4 x Double arrays x 512 x 8 B = 16 KB  +  1 x Int64 array x 512 x 8 B = 4 KB
+    const
+      EXP_LOG_BLOCK = 512;
   strict protected
     // Range reduction constants of the scalar code. ln2 = LN2HI + LN2LO, where
     // LN2HI has trailing mantissa bits zero so that n*LN2HI is exact (fdlibm).
@@ -143,37 +156,6 @@ uses
   VecMath.SSE2,
   VecMath.AVX;
 
-// Block size for cache-blocked operations.
-// Working arrays (V, R, P, NLn2, N) fit in L1 cache (typically 32 KB):
-//   4 x Double arrays x 512 x 8 B = 16 KB  +  1 x Int64 array x 512 x 8 B = 4 KB
-Const
-  EXP_LOG_BLOCK = 512;
-
-Type
-  // Steps through an array of Length elements in blocks of EXP_LOG_BLOCK
-  TBlocks = record
-    Start,Count,Length: Integer;
-    Constructor Create(ArrayLength: Integer);
-    Function Next: Boolean;
-  end;
-
-Constructor TBlocks.Create(ArrayLength: Integer);
-begin
-  Start := 0;
-  Count := 0;
-  Length := ArrayLength;
-end;
-
-Function TBlocks.Next: Boolean;
-begin
-  Inc(Start, Count);
-  Count := Length - Start;
-  if Count > EXP_LOG_BLOCK then Count := EXP_LOG_BLOCK;
-  Result := Count > 0;
-end;
-
-////////////////////////////////////////////////////////////////////////////////
-
 Procedure TScratchBuffer.EnsureSize(Len: Integer);
 var I: Integer;
 begin
@@ -188,6 +170,23 @@ Procedure TExpMoments.Add(const Moments: TExpMoments);
 begin
   First := First + Moments.First;
   Second := Second + Moments.Second;
+end;
+
+////////////////////////////////////////////////////////////////////////////////
+
+Constructor TVectorMath.TBlocks.Create(ArrayLength: Integer);
+begin
+  Start := 0;
+  Count := 0;
+  Length := ArrayLength;
+end;
+
+Function TVectorMath.TBlocks.Next: Boolean;
+begin
+  Inc(Start, Count);
+  Count := Length - Start;
+  if Count > EXP_LOG_BLOCK then Count := EXP_LOG_BLOCK;
+  Result := Count > 0;
 end;
 
 ////////////////////////////////////////////////////////////////////////////////
